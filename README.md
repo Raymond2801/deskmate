@@ -38,11 +38,19 @@ need any of them.
 2. It replies with your numeric ID. Copy it — this makes you the
    administrator, the only person who can upload documents to your bot.
 
+<!-- TODO(seller): this whole section is a stand-in until the Railway
+     template is published. Replace steps 1-2 with a single "Deploy on
+     Railway" template button and drop the fork step once that exists. -->
+
 ### 4. Deploy on Railway
 
-1. Click: **[Deploy on Railway](https://railway.app/template/deskmate)**
-   *(replace with your published template link)*
-2. When asked for environment variables, fill in:
+1. On GitHub, open the Deskmate repository and click **Fork** (top right)
+   to create your own copy. You'll deploy from this copy, not the original.
+2. Go to [railway.app](https://railway.app) and sign up or log in.
+3. Click **New Project**, then **Deploy from GitHub repo**, and select your
+   forked copy of the Deskmate repository.
+4. Once the project is created, open it, go to the **Variables** tab, and
+   add:
 
    | Variable | Value |
    |---|---|
@@ -51,8 +59,8 @@ need any of them.
    | `COMPANY_NAME` | your company's name, e.g. `Acme Pty Ltd` |
    | `ADMIN_USER_ID` | your numeric ID from step 3 |
 
-3. Click Deploy. Railway builds and starts the bot — this takes a couple of
-   minutes.
+5. Railway redeploys automatically after you save the variables — this
+   takes a couple of minutes. Watch the **Deployments** tab for "Success".
 
 ### 5. Talk to your bot
 
