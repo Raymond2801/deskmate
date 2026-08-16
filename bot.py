@@ -9,6 +9,7 @@ from pathlib import Path
 
 from telegram import Update
 from telegram.constants import ChatAction
+from telegram.error import Conflict
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 import doctor
@@ -243,6 +244,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     buffer["timer_task"] = asyncio.create_task(_flush_after_delay(key, context, state))
 
 
+async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Registered with Application.add_error_handler so PTB has somewhere
+    to send errors instead of dumping a full traceback via "No error
+    handlers are registered". Without this, every Railway redeploy — old
+    and new container briefly polling the same bot token at once — logs a
+    scary traceback for what is actually an expected, self-recovering
+    condition (PTB's polling loop already retries indefinitely on its
+    own; registering a handler doesn't change that, it only controls how
+    the error gets reported)."""
+    error = context.error
+
+    if isinstance(error, Conflict):
+        logger.warning(
+            "Another Deskmate instance is polling for the same bot (expected "
+            "briefly during a Railway redeploy) — Telegram rejected this "
+            "instance's poll; retrying."
+        )
+        return
+
+    logger.error("Unhandled error while processing update %s: %s", update, error, exc_info=error)
+    doctor.record_last_error(f"Unhandled error: {error}")
+
+
 def main() -> None:
     config = load_config()
     logging.getLogger().setLevel(config.log_level)
@@ -263,6 +287,7 @@ def main() -> None:
     application.add_handler(CommandHandler("reset_demo", handle_reset_demo))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_error_handler(handle_error)
 
     logger.info("Deskmate starting for %s (%d documents loaded)", config.company_name, len(corpus))
     application.run_polling(allowed_updates=Update.ALL_TYPES)
