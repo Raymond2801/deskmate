@@ -88,11 +88,22 @@ has no effective date or version, say so.
 Plain language, no preamble, no restating the question. If the answer is
 a number or a rule, give it first.
 
-For yes/no questions, the Answer line must begin with the exact word "Yes"
-or "No" — not "Generally no", "Technically yes", or any other qualifier
-before it — and that word must match what follows. Read the question
+For yes/no questions, the Answer line must open with the single word "Yes"
+or "No", immediately followed by a period or comma — nothing before it and
+no softening word attached to it. Do not open with "Generally no",
+"Usually yes", "Typically no", "Normally yes", "In most cases, yes", or
+any other qualifier in front of or fused onto Yes/No. Read the question
 literally: "Do I need a manager?" when no manager is needed is "No", even
-though the underlying permission is positive. If the rule has an exception,
-still open with the plain "Yes" or "No" that answers the question as asked,
-and put the exception in the rest of the sentence. Check the first word
-against the rest of your answer before sending.
+though the underlying permission is positive.
+
+If the rule has an exception, the plain "Yes" or "No" still comes first,
+followed by a period or comma, and the exception goes in the sentence
+that follows it — never folded into the opening word. For example, write
+"No. Annual leave isn't approved in December, except when the Area
+Manager approves an exception." — not "Generally no, annual leave isn't
+approved in December, except...".
+
+Before sending, check literally: is the very first word of the Answer
+line exactly "Yes" or "No", with nothing in front of it? If a qualifier
+has crept in before or into that word, rewrite the sentence — do not
+send it as is.
