@@ -24,6 +24,35 @@ logging.basicConfig(
 )
 logger = logging.getLogger("deskmate.bot")
 
+# httpx logs "HTTP Request: <method> <url> ..." at INFO, and the Telegram
+# Bot API puts the bot token directly in the URL path
+# (api.telegram.org/bot<TOKEN>/<method>). Capped here, not just via
+# LOG_LEVEL, so raising LOG_LEVEL to DEBUG for troubleshooting can't
+# reopen this leak — each logger's own level takes precedence over the
+# root logger's.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+class RedactSecretsFilter(logging.Filter):
+    """Strip known secret values out of every log line before it's
+    emitted, regardless of which logger or library produced it. This is a
+    backstop behind the httpx/httpcore level caps above, in case some
+    other library ever logs a secret at a level we don't expect."""
+
+    def __init__(self, secrets: list[str]) -> None:
+        super().__init__()
+        self._secrets = [s for s in secrets if s]
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        for secret in self._secrets:
+            message = message.replace(secret, "[REDACTED]")
+        record.msg = message
+        record.args = None
+        return True
+
+
 DEBOUNCE_SECONDS = 3
 ANSWER_TIMEOUT_SECONDS = 65  # slightly above answer.API_TIMEOUT_SECONDS as a hard backstop
 
@@ -217,6 +246,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 def main() -> None:
     config = load_config()
     logging.getLogger().setLevel(config.log_level)
+
+    redact_filter = RedactSecretsFilter([config.telegram_bot_token, config.anthropic_api_key])
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(redact_filter)
 
     corpus = Corpus.load()
     state = BotState(config, corpus)
