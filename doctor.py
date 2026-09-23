@@ -51,6 +51,10 @@ def run_doctor(config: Config, corpus: Corpus) -> str:
     lines.append(f"TELEGRAM_BOT_TOKEN: {_mask_secret(config.telegram_bot_token)}")
     lines.append(f"COMPANY_NAME: {config.company_name}")
     lines.append(f"ADMIN_USER_ID: {config.admin_user_id}")
+    if config.healthcheck_ping_url:
+        lines.append(f"HEALTHCHECK_PING_URL: {_mask_secret(config.healthcheck_ping_url)}")
+    else:
+        lines.append("HEALTHCHECK_PING_URL: not set (optional)")
 
     total_words = corpus.total_word_count()
     lines.append(f"Documents: {len(corpus)} files, {total_words:,} words total")

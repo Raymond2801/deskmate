@@ -116,6 +116,7 @@ async def run() -> int:
         allowed_chat_ids=frozenset(),
         model=os.environ.get("MODEL", "").strip() or "claude-sonnet-4-6",
         log_level="INFO",
+        healthcheck_ping_url=None,
     )
 
     corpus = Corpus.load()

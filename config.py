@@ -29,6 +29,7 @@ class Config:
     allowed_chat_ids: frozenset[int]
     model: str
     log_level: str
+    healthcheck_ping_url: str | None
 
 
 def _fail(message: str) -> None:
@@ -69,4 +70,5 @@ def load_config() -> Config:
         allowed_chat_ids=allowed_chat_ids,
         model=os.environ.get("MODEL", "").strip() or DEFAULT_MODEL,
         log_level=os.environ.get("LOG_LEVEL", "").strip() or DEFAULT_LOG_LEVEL,
+        healthcheck_ping_url=os.environ.get("HEALTHCHECK_PING_URL", "").strip() or None,
     )

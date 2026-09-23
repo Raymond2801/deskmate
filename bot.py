@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import time
 from pathlib import Path
 
+import httpx
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.error import Conflict
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, ContextTypes, ExtBot, MessageHandler, filters
 
 import doctor
 import ingest
@@ -57,6 +59,13 @@ class RedactSecretsFilter(logging.Filter):
 DEBOUNCE_SECONDS = 3
 ANSWER_TIMEOUT_SECONDS = 65  # slightly above answer.API_TIMEOUT_SECONDS as a hard backstop
 
+POLL_TIMEOUT_SECONDS = 10  # Telegram long-poll timeout passed to run_polling
+HEARTBEAT_CHECK_INTERVAL_SECONDS = 300
+# A poll succeeds roughly every POLL_TIMEOUT_SECONDS under normal operation, so
+# anything older than 2x that means getUpdates itself is stuck, not just quiet.
+HEARTBEAT_STALE_AFTER_SECONDS = 2 * POLL_TIMEOUT_SECONDS
+HEALTHCHECK_REQUEST_TIMEOUT_SECONDS = 10
+
 GREETING = (
     "Hi, I'm {company_name}'s policy assistant. Ask me a question about "
     "company policy and I'll answer from our internal documents, with a "
@@ -78,6 +87,48 @@ UNSUPPORTED_FILE_MESSAGE = (
     "I can only read .md, .txt, .docx, and .pdf files. Please convert this "
     "file and try again."
 )
+
+
+class HeartbeatTracker:
+    """Holds the monotonic timestamp of the last getUpdates call that
+    returned without raising. `None` until the first successful poll."""
+
+    def __init__(self) -> None:
+        self.last_success: float | None = None
+
+
+class HeartbeatBot(ExtBot):
+    """ExtBot subclass that stamps HeartbeatTracker on every getUpdates
+    call that returns successfully, empty or not — the only signal that
+    Telegram polling, not just the process, is actually alive. A prior
+    incident ran 9 hours with the process up but every getUpdates call
+    failing (Bad Gateway), so uptime alone isn't proof of a working bot."""
+
+    def __init__(self, *args, heartbeat: HeartbeatTracker, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._heartbeat = heartbeat
+
+    async def get_updates(self, *args, **kwargs):
+        result = await super().get_updates(*args, **kwargs)
+        self._heartbeat.last_success = time.monotonic()
+        return result
+
+
+async def _heartbeat_loop(heartbeat: HeartbeatTracker, ping_url: str) -> None:
+    """Pings healthchecks.io on an interval, but only while getUpdates is
+    actually succeeding — pinging on a bare timer would report healthy
+    even while polling is stuck."""
+    async with httpx.AsyncClient() as client:
+        while True:
+            await asyncio.sleep(HEARTBEAT_CHECK_INTERVAL_SECONDS)
+            last_success = heartbeat.last_success
+            if last_success is None or time.monotonic() - last_success > HEARTBEAT_STALE_AFTER_SECONDS:
+                logger.warning("Skipping healthcheck ping: last successful Telegram poll is stale.")
+                continue
+            try:
+                await client.get(ping_url, timeout=HEALTHCHECK_REQUEST_TIMEOUT_SECONDS)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Healthcheck ping failed: %s", exc)
 
 
 class BotState:
@@ -271,14 +322,28 @@ def main() -> None:
     config = load_config()
     logging.getLogger().setLevel(config.log_level)
 
-    redact_filter = RedactSecretsFilter([config.telegram_bot_token, config.anthropic_api_key])
+    redact_filter = RedactSecretsFilter(
+        [config.telegram_bot_token, config.anthropic_api_key, config.healthcheck_ping_url or ""]
+    )
     for handler in logging.getLogger().handlers:
         handler.addFilter(redact_filter)
 
     corpus = Corpus.load()
     state = BotState(config, corpus)
 
-    application = Application.builder().token(config.telegram_bot_token).build()
+    heartbeat = HeartbeatTracker()
+    bot = HeartbeatBot(token=config.telegram_bot_token, heartbeat=heartbeat)
+    builder = Application.builder().bot(bot)
+
+    if config.healthcheck_ping_url:
+        ping_url = config.healthcheck_ping_url
+
+        async def _start_heartbeat(application: Application) -> None:
+            asyncio.create_task(_heartbeat_loop(heartbeat, ping_url))
+
+        builder = builder.post_init(_start_heartbeat)
+
+    application = builder.build()
     application.bot_data["state"] = state
 
     application.add_handler(CommandHandler("start", handle_start))
@@ -290,7 +355,7 @@ def main() -> None:
     application.add_error_handler(handle_error)
 
     logger.info("Deskmate starting for %s (%d documents loaded)", config.company_name, len(corpus))
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(allowed_updates=Update.ALL_TYPES, timeout=POLL_TIMEOUT_SECONDS)
 
 
 if __name__ == "__main__":
