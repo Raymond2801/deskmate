@@ -1,89 +1,50 @@
 # Deskmate
 
-Deskmate is a Telegram bot that answers staff questions from your company's own
-policy documents. Ask it something in your team's Telegram group, and it
-answers from the documents you uploaded, with the source cited. If the answer
-isn't in your documents, it says so instead of guessing.
+A Telegram bot that answers staff questions from a company's own policy
+documents, citing the source, and saying so when the answer isn't in the
+documents rather than guessing. Single-tenant: one deployment serves one
+company, using that company's own Anthropic and Telegram credentials.
 
-This guide assumes you have never used a terminal, git, or Python. You won't
-need any of them.
+## Requirements
 
-## What you'll need
+- Python 3.11+
+- A Telegram bot token ([@BotFather](https://t.me/BotFather))
+- An Anthropic API key ([console.anthropic.com](https://console.anthropic.com))
+- A host that can run a long-lived process (deploys as-is on Railway via
+  `railway.json`/`Procfile`)
 
-- A Telegram account
-- An Anthropic API key (a few minutes to get, see step 2 below)
-- A credit card for Railway (hosting) and Anthropic (the AI model) — you pay
-  both of these directly, not through us. Typical cost for a small team is a
-  few dollars a month.
+## Configuration
 
-## Setup
+All configuration is environment variables, validated at startup in
+`config.py`.
 
-### 1. Create your Telegram bot
+| Variable | Required | Notes |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | yes | From console.anthropic.com |
+| `TELEGRAM_BOT_TOKEN` | yes | From @BotFather |
+| `COMPANY_NAME` | yes | Inserted into the bot's answers |
+| `ADMIN_USER_ID` | yes | Numeric Telegram user ID; only this account can upload documents |
+| `ALLOWED_CHAT_IDS` | no | Comma-separated chat IDs to restrict responses to; blank = any chat |
+| `MODEL` | no | Overrides the default Claude model |
+| `LOG_LEVEL` | no | `DEBUG`/`INFO`/`WARNING`/`ERROR`, default `INFO` |
+| `HEALTHCHECK_PING_URL` | no | healthchecks.io (or compatible) ping URL for uptime monitoring |
 
-1. Open Telegram and message **@BotFather**.
-2. Send `/newbot` and follow the prompts to name your bot.
-3. BotFather gives you a **bot token** — a long string like
-   `123456789:AAExampleTokenDoNotUseThisOne`. Copy it, you'll need it in
-   step 4.
+See `.env.example`.
 
-### 2. Get an Anthropic API key
+## Running locally
 
-1. Go to [console.anthropic.com](https://console.anthropic.com) and sign up.
-2. Create an API key and add billing details. Copy the key (starts with
-   `sk-ant-`).
+```
+pip install -r requirements.txt
+cp .env.example .env   # fill in values
+python bot.py
+```
 
-### 3. Find your Telegram user ID
+## Storage
 
-1. Message **@userinfobot** on Telegram.
-2. It replies with your numeric ID. Copy it — this makes you the
-   administrator, the only person who can upload documents to your bot.
-
-<!-- TODO(seller): this whole section is a stand-in until the Railway
-     template is published. Replace steps 1-2 with a single "Deploy on
-     Railway" template button and drop the fork step once that exists. -->
-
-### 4. Deploy on Railway
-
-1. On GitHub, open the Deskmate repository and click **Fork** (top right)
-   to create your own copy. You'll deploy from this copy, not the original.
-2. Go to [railway.app](https://railway.app) and sign up or log in.
-3. Click **New Project**, then **Deploy from GitHub repo**, and select your
-   forked copy of the Deskmate repository.
-4. Once the project is created, open it, go to the **Variables** tab, and
-   add:
-
-   | Variable | Value |
-   |---|---|
-   | `ANTHROPIC_API_KEY` | the key from step 2 |
-   | `TELEGRAM_BOT_TOKEN` | the token from step 1 |
-   | `COMPANY_NAME` | your company's name, e.g. `Acme Pty Ltd` |
-   | `ADMIN_USER_ID` | your numeric ID from step 3 |
-
-5. Railway redeploys automatically after you save the variables — this
-   takes a couple of minutes. Watch the **Deployments** tab for "Success".
-
-### 5. Talk to your bot
-
-1. Find your bot on Telegram (search the username you gave it in step 1) and
-   send `/start`.
-2. Add it to your team's group chat if you want it answering there too.
-3. As the admin, send it a message and try `/docs` — it should list the demo
-   documents that ship with Deskmate, so you have something to test with
-   right away.
-
-### 6. Upload your real documents
-
-1. In a direct message with the bot (you must be the admin), send your
-   policy documents as file attachments — `.md`, `.txt`, `.docx`, or `.pdf`,
-   up to 10MB each.
-2. The bot confirms each file with the number of words it extracted. If that
-   number looks too low, the file may not have extracted properly — try
-   re-saving it and uploading again.
-3. Once your real documents are in, send `/reset_demo` to remove the demo
-   documents that shipped with Deskmate.
-
-Your staff can now ask questions in the group, and the bot answers from your
-documents.
+Uploaded documents and the corpus index persist under `data/`. Mount a
+persistent volume at this path in production — without one, documents are
+lost on redeploy. Accepts `.md`, `.txt`, `.docx`, `.pdf`, up to 10MB each,
+50 files max.
 
 ## Commands
 
@@ -91,17 +52,5 @@ documents.
 |---|---|---|
 | `/start` | everyone | A short greeting |
 | `/docs` | everyone | Lists the documents the bot can answer from |
-| `/doctor` | admin only | A diagnostic report — paste this if you need support |
-| `/reset_demo` | admin only | Removes the demo documents after you've uploaded your own |
-
-## If something's not working
-
-Message your bot `/doctor` (you must be the admin). It prints a report of
-its configuration and document status. Paste that report when asking for
-help — it's designed to show what's wrong at a glance.
-
-## Billing
-
-You pay Railway and Anthropic directly with your own accounts. Neither we
-nor your documents ever touch our infrastructure — everything runs on the
-Railway project you just created, using your own API key.
+| `/doctor` | admin only | Diagnostic report: config status, document count, last error |
+| `/reset_demo` | admin only | Removes the demo documents after real ones are uploaded |
