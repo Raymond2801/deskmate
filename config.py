@@ -18,6 +18,7 @@ REQUIRED_VARS = (
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_LOG_LEVEL = "INFO"
+DEFAULT_TELEGRAM_API_BASE_URL = "https://api.telegram.org/bot"
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,7 @@ class Config:
     model: str
     log_level: str
     healthcheck_ping_url: str | None
+    telegram_api_base_url: str = DEFAULT_TELEGRAM_API_BASE_URL
 
 
 def _fail(message: str) -> None:
@@ -71,4 +73,5 @@ def load_config() -> Config:
         model=os.environ.get("MODEL", "").strip() or DEFAULT_MODEL,
         log_level=os.environ.get("LOG_LEVEL", "").strip() or DEFAULT_LOG_LEVEL,
         healthcheck_ping_url=os.environ.get("HEALTHCHECK_PING_URL", "").strip() or None,
+        telegram_api_base_url=os.environ.get("TELEGRAM_API_BASE_URL", "").strip() or DEFAULT_TELEGRAM_API_BASE_URL,
     )
