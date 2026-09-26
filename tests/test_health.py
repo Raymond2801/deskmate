@@ -9,9 +9,12 @@ the one subprocess test that proves os._exit really ends the process.
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
 import sys
+import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -48,6 +51,16 @@ class FakeHttpClient:
         response = mock.Mock()
         response.raise_for_status = mock.Mock()
         return response
+
+
+_marker_dir = tempfile.TemporaryDirectory()
+
+
+def new_health(clock, marker_name: str | None = None) -> health.PollingHealth:
+    """PollingHealth whose delivery-stall marker lives in a temp dir, never
+    in the repo's data/ folder."""
+    name = marker_name or f"marker-{time.monotonic_ns()}"
+    return health.PollingHealth(clock=clock, stall_marker=Path(_marker_dir.name) / name)
 
 
 def make_bot(polling_health: health.PollingHealth) -> HeartbeatBot:
@@ -93,7 +106,7 @@ def run_heartbeat(clock: FakeClock, bot: HeartbeatBot, polling_health, checks: i
 class HeartbeatBotTests(unittest.TestCase):
     def test_success_is_recorded_only_when_get_updates_returns(self):
         clock = FakeClock()
-        polling_health = health.PollingHealth(clock=clock)
+        polling_health = new_health(clock)
         bot = make_bot(polling_health)
 
         with mock.patch.object(ExtBot, "get_updates", side_effect=NetworkError("Bad Gateway")):
@@ -108,7 +121,7 @@ class HeartbeatBotTests(unittest.TestCase):
 class BadGatewayTests(unittest.TestCase):
     def test_poll_goes_stale_exactly_after_threshold(self):
         clock = FakeClock()
-        polling_health = health.PollingHealth(clock=clock)
+        polling_health = new_health(clock)
         bot = make_bot(polling_health)
 
         with mock.patch.object(ExtBot, "get_updates", return_value=[]):
@@ -126,7 +139,7 @@ class BadGatewayTests(unittest.TestCase):
 
     def test_heartbeat_stops_pinging_once_bad_gateway_starts(self):
         clock = FakeClock()
-        polling_health = health.PollingHealth(clock=clock)
+        polling_health = new_health(clock)
         bot = make_bot(polling_health)
         failing = {"on": False}
 
@@ -145,7 +158,7 @@ class BadGatewayTests(unittest.TestCase):
 
     def test_watchdog_exits_non_zero_after_continuous_bad_gateway(self):
         clock = FakeClock()
-        polling_health = health.PollingHealth(clock=clock)
+        polling_health = new_health(clock)
         bot = make_bot(polling_health)
         exit_codes: list[int] = []
         exit_times: list[float] = []
@@ -192,15 +205,16 @@ class BadGatewayTests(unittest.TestCase):
         script = textwrap.dedent(
             """
             import sys, time
+            from pathlib import Path
             sys.path.insert(0, %r)
             import health
             health.WATCHDOG_CHECK_INTERVAL_SECONDS = 0.05
             health.WATCHDOG_EXIT_AFTER_SECONDS = 0.3
-            health.start_exit_watchdog(health.PollingHealth())
+            health.start_exit_watchdog(health.PollingHealth(stall_marker=Path(%r)))
             time.sleep(30)
             sys.exit(0)
             """
-            % str(REPO_ROOT)
+            % (str(REPO_ROOT), str(Path(_marker_dir.name) / "subprocess-marker"))
         )
         result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, health.WATCHDOG_EXIT_CODE)
@@ -209,7 +223,7 @@ class BadGatewayTests(unittest.TestCase):
 class HealthyPollingTests(unittest.TestCase):
     def test_empty_successful_polls_keep_heartbeat_pinging(self):
         clock = FakeClock()
-        polling_health = health.PollingHealth(clock=clock)
+        polling_health = new_health(clock)
         bot = make_bot(polling_health)
 
         with mock.patch.object(ExtBot, "get_updates", return_value=[]):
@@ -219,7 +233,7 @@ class HealthyPollingTests(unittest.TestCase):
 
     def test_watchdog_does_not_fire_while_polls_succeed(self):
         clock = FakeClock()
-        polling_health = health.PollingHealth(clock=clock)
+        polling_health = new_health(clock)
         bot = make_bot(polling_health)
         exit_codes: list[int] = []
         sleeps = {"n": 0}
@@ -243,7 +257,7 @@ class DeliveryStallTests(unittest.TestCase):
 
     def test_pending_updates_never_delivered_is_a_problem(self):
         clock = FakeClock()
-        polling_health = health.PollingHealth(clock=clock)
+        polling_health = new_health(clock)
         polling_health.record_poll_success([])
         polling_health.record_pending_count(3)
         self.assertIsNone(polling_health.problem())
@@ -255,7 +269,7 @@ class DeliveryStallTests(unittest.TestCase):
 
     def test_pending_updates_that_do_arrive_are_fine(self):
         clock = FakeClock()
-        polling_health = health.PollingHealth(clock=clock)
+        polling_health = new_health(clock)
         polling_health.record_pending_count(1)
         clock.advance(health.DELIVERY_CHECK_INTERVAL_SECONDS)
         polling_health.record_poll_success(["an update"])
@@ -264,7 +278,7 @@ class DeliveryStallTests(unittest.TestCase):
 
     def test_stall_clears_once_telegram_has_nothing_pending(self):
         clock = FakeClock()
-        polling_health = health.PollingHealth(clock=clock)
+        polling_health = new_health(clock)
         for _ in range(3):
             clock.advance(health.DELIVERY_CHECK_INTERVAL_SECONDS)
             polling_health.record_poll_success([])
@@ -274,10 +288,107 @@ class DeliveryStallTests(unittest.TestCase):
         self.assertIsNone(polling_health.problem())
 
 
+def run_watchdog(polling_health, clock, tick, max_seconds=3600):
+    """Runs the exit watchdog on a fake clock. `tick` runs on every watchdog
+    sleep to simulate the event loop. Returns the exit codes it produced."""
+    exit_codes: list[int] = []
+    start = clock.now
+
+    def fake_sleep(seconds):
+        clock.advance(seconds)
+        tick()
+        if exit_codes or clock.now - start > max_seconds:
+            raise SystemExit
+
+    thread = health.start_exit_watchdog(polling_health, exit_fn=exit_codes.append, sleep_fn=fake_sleep)
+    thread.join(timeout=5)
+    return exit_codes
+
+
+class FilteredUpdateFalsePositiveTests(unittest.TestCase):
+    """PTB's ALL_TYPES lags the Bot API, so some update types are filtered.
+    If Telegram counts those as pending, the delivery check sees a stall that
+    no restart can fix. It must restart once, then hold instead of looping."""
+
+    def make_stalled_process(self, clock, marker_name):
+        polling_health = new_health(clock, marker_name)
+        polling_health.record_poll_success([])
+        polling_health.evaluate()
+
+        def tick():
+            polling_health.record_poll_success([])  # polls keep succeeding, empty
+            polling_health.record_pending_count(1)  # the filtered update never goes away
+            polling_health.evaluate()
+
+        return polling_health, tick
+
+    def test_first_stall_restarts_second_holds(self):
+        clock = FakeClock()
+        first, tick = self.make_stalled_process(clock, "filtered")
+        self.assertEqual(run_watchdog(first, clock, tick), [health.WATCHDOG_EXIT_CODE])
+        self.assertTrue(first.stall_marker.exists())
+
+        # Railway restarts the process; same volume, same pending update.
+        second, tick = self.make_stalled_process(clock, "filtered")
+        self.assertEqual(run_watchdog(second, clock, tick, max_seconds=6 * 3600), [])
+        self.assertIsNotNone(second.problem())  # heartbeat stays off, so the owner gets alerted
+
+    def test_heartbeat_stays_off_while_holding(self):
+        clock = FakeClock()
+        polling_health, _ = self.make_stalled_process(clock, "held-heartbeat")
+        polling_health.record_stall_restart()
+        for _ in range(health.PENDING_CHECKS_BEFORE_STALL):
+            polling_health.record_pending_count(1)
+        bot = make_bot(polling_health)
+
+        def on_check(n):
+            polling_health.record_pending_count(1)
+
+        with mock.patch.object(ExtBot, "get_updates", return_value=[]):
+            pings = run_heartbeat(clock, bot, polling_health, checks=4, on_check=on_check)
+        self.assertEqual(pings, [])
+
+    def test_old_marker_from_a_previous_episode_allows_a_restart(self):
+        clock = FakeClock()
+        polling_health, tick = self.make_stalled_process(clock, "old-marker")
+        polling_health.record_stall_restart()
+        old = time.time() - health.DELIVERY_STALL_MARKER_MAX_AGE_SECONDS - 60
+        os.utime(polling_health.stall_marker, (old, old))
+        self.assertEqual(run_watchdog(polling_health, clock, tick), [health.WATCHDOG_EXIT_CODE])
+
+    def test_marker_cleared_once_telegram_reports_nothing_pending(self):
+        clock = FakeClock()
+        polling_health = new_health(clock, "cleared")
+        polling_health.record_stall_restart()
+        polling_health.record_poll_success([])
+        polling_health.record_pending_count(0)
+        polling_health.evaluate()
+        self.assertFalse(polling_health.stall_marker.exists())
+
+    def test_marker_does_not_block_exit_for_bad_gateway(self):
+        clock = FakeClock()
+        polling_health = new_health(clock, "bad-gateway-with-marker")
+        polling_health.record_stall_restart()
+        polling_health.evaluate()
+        # getUpdates never succeeds again: a network problem, not a stall.
+        self.assertEqual(run_watchdog(polling_health, clock, polling_health.evaluate), [health.WATCHDOG_EXIT_CODE])
+
+    def test_marker_does_not_block_exit_when_event_loop_is_stuck(self):
+        clock = FakeClock()
+        polling_health, tick = self.make_stalled_process(clock, "stuck-loop")
+        polling_health.record_stall_restart()
+        for _ in range(4):
+            clock.advance(health.DELIVERY_CHECK_INTERVAL_SECONDS)
+            tick()
+        self.assertEqual(polling_health.last_problem_kind, health.PROBLEM_DELIVERY_STALL)
+        # From here the loop is frozen: nothing calls evaluate() any more.
+        self.assertEqual(run_watchdog(polling_health, clock, lambda: None), [health.WATCHDOG_EXIT_CODE])
+
+
 class QueueStallTests(unittest.TestCase):
     def test_backlog_without_processing_is_a_problem(self):
         clock = FakeClock()
-        polling_health = health.PollingHealth(clock=clock)
+        polling_health = new_health(clock)
         polling_health.record_queue_size(4)
         for _ in range(int(health.QUEUE_STALL_AFTER_SECONDS // 10) + 1):
             clock.advance(10)
@@ -287,7 +398,7 @@ class QueueStallTests(unittest.TestCase):
 
     def test_backlog_that_keeps_draining_is_fine(self):
         clock = FakeClock()
-        polling_health = health.PollingHealth(clock=clock)
+        polling_health = new_health(clock)
         for _ in range(30):
             clock.advance(10)
             polling_health.record_poll_success(["u"])

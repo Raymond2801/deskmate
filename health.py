@@ -16,6 +16,16 @@ thread (not an asyncio task, so it still fires if the event loop itself is
 blocked) logs CRITICAL and hard-exits with a non-zero code so Railway's
 restart policy brings up a fresh process. A manual restart is what fixed
 the 2026-09-26 incident.
+
+Check 2 can also fire for a reason a restart won't fix. We poll with PTB's
+Update.ALL_TYPES, which lags the Bot API (PTB 22.8 knows Bot API 10.0;
+Telegram is on 10.3 and has update types PTB doesn't list), so some update
+types are filtered out. Telegram doesn't document whether filtered updates
+count toward pending_update_count, and it keeps updates for up to 24h. To
+avoid a restart loop, a delivery stall gets one restart per episode: a
+marker on the data volume records it, and if the stall is back after that
+restart the watchdog stays put and leaves the heartbeat down to alert the
+owner instead.
 """
 
 from __future__ import annotations
@@ -25,9 +35,12 @@ import logging
 import os
 import threading
 import time
+from pathlib import Path
 from typing import Callable
 
 import httpx
+
+from corpus import DATA_DIR
 
 logger = logging.getLogger("deskmate.health")
 
@@ -63,14 +76,30 @@ WATCHDOG_CHECK_INTERVAL_SECONDS = 15
 WATCHDOG_EXIT_AFTER_SECONDS = 300
 WATCHDOG_EXIT_CODE = 3
 
+DELIVERY_STALL_MARKER = DATA_DIR / "delivery_stall_restart"
+# Telegram drops undelivered updates after 24h, so a stall older than that
+# can't be the same episode.
+DELIVERY_STALL_MARKER_MAX_AGE_SECONDS = 24 * 3600
+# If evaluate() hasn't run for this long, the event loop is not responding.
+EVENT_LOOP_UNRESPONSIVE_AFTER_SECONDS = 4 * QUEUE_CHECK_INTERVAL_SECONDS
+
+PROBLEM_POLL_STALE = "poll_stale"
+PROBLEM_DELIVERY_STALL = "delivery_stall"
+PROBLEM_QUEUE_STALL = "queue_stall"
+
 
 class PollingHealth:
     """Connectivity state shared by the bot, the monitor tasks, the
     heartbeat and the exit watchdog. All timestamps come from `clock`
     (monotonic by default) so tests can drive time directly."""
 
-    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self,
+        clock: Callable[[], float] = time.monotonic,
+        stall_marker: Path = DELIVERY_STALL_MARKER,
+    ) -> None:
         self.clock = clock
+        self.stall_marker = stall_marker
         self.started_at = clock()
         self.last_poll_success: float | None = None
         self.last_update_received: float | None = None
@@ -84,7 +113,9 @@ class PollingHealth:
         # only this, so a blocked event loop (evaluate() never runs) also
         # counts as unhealthy.
         self.last_healthy = self.started_at
+        self.last_evaluated = self.started_at
         self.last_problem: str | None = None
+        self.last_problem_kind: str | None = None
 
     def record_poll_success(self, updates: object) -> None:
         now = self.clock()
@@ -119,15 +150,19 @@ class PollingHealth:
 
     def problem(self) -> str | None:
         """Why the bot is not healthy right now, or None if it is."""
+        found = self._find_problem()
+        return found[1] if found else None
+
+    def _find_problem(self) -> tuple[str, str] | None:
         now = self.clock()
 
         reference = self.last_poll_success if self.last_poll_success is not None else self.started_at
         poll_age = now - reference
         if poll_age > POLL_STALE_AFTER_SECONDS:
-            return f"no successful getUpdates for {poll_age:.0f}s"
+            return PROBLEM_POLL_STALE, f"no successful getUpdates for {poll_age:.0f}s"
 
         if self.pending_streak >= PENDING_CHECKS_BEFORE_STALL:
-            return (
+            return PROBLEM_DELIVERY_STALL, (
                 f"Telegram reports {self.pending_update_count} pending update(s) but getUpdates "
                 f"delivered none across {self.pending_streak} consecutive checks"
             )
@@ -137,24 +172,51 @@ class PollingHealth:
             if self.last_update_processed is not None:
                 progress = max(progress, self.last_update_processed)
             if now - progress > QUEUE_STALL_AFTER_SECONDS:
-                return (
+                return PROBLEM_QUEUE_STALL, (
                     f"{self.queue_size} update(s) waiting in the queue with no processing "
                     f"progress for {now - progress:.0f}s"
                 )
 
         return None
 
+    def stall_restart_already_tried(self) -> bool:
+        try:
+            age = time.time() - self.stall_marker.stat().st_mtime
+        except OSError:
+            return False
+        return age < DELIVERY_STALL_MARKER_MAX_AGE_SECONDS
+
+    def record_stall_restart(self) -> None:
+        try:
+            self.stall_marker.parent.mkdir(parents=True, exist_ok=True)
+            self.stall_marker.touch()
+        except OSError as exc:
+            logger.warning("Could not write delivery-stall marker: %s", exc)
+
+    def clear_stall_marker(self) -> None:
+        try:
+            self.stall_marker.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Could not remove delivery-stall marker: %s", exc)
+
     def evaluate(self) -> str | None:
         """Run problem(), stamp last_healthy when there is none, and log
         transitions between healthy and unhealthy once each."""
-        problem = self.problem()
+        found = self._find_problem()
+        kind, problem = found if found else (None, None)
+        self.last_evaluated = self.clock()
         if problem is None:
             if self.last_problem is not None:
                 logger.info("Telegram connectivity recovered.")
             self.last_healthy = self.clock()
+            if self.pending_update_count == 0 and self.last_delivery_check is not None:
+                # Telegram has confirmed nothing is waiting: the stall episode
+                # is over, so a future stall may restart again.
+                self.clear_stall_marker()
         elif self.last_problem is None:
             logger.warning("Telegram connectivity unhealthy: %s", problem)
         self.last_problem = problem
+        self.last_problem_kind = kind
         return problem
 
 
@@ -210,10 +272,29 @@ def start_exit_watchdog(
     the only goal here is a non-zero exit Railway will restart."""
 
     def run() -> None:
+        holding_logged = False
         while True:
             sleep_fn(WATCHDOG_CHECK_INTERVAL_SECONDS)
-            unhealthy_for = health.clock() - health.last_healthy
-            if unhealthy_for > WATCHDOG_EXIT_AFTER_SECONDS:
+            now = health.clock()
+            unhealthy_for = now - health.last_healthy
+            if unhealthy_for <= WATCHDOG_EXIT_AFTER_SECONDS:
+                holding_logged = False
+            else:
+                loop_responding = now - health.last_evaluated <= EVENT_LOOP_UNRESPONSIVE_AFTER_SECONDS
+                delivery_stall = loop_responding and health.last_problem_kind == PROBLEM_DELIVERY_STALL
+                if delivery_stall and health.stall_restart_already_tried():
+                    if not holding_logged:
+                        logger.error(
+                            "Delivery stall persists after a restart (%s). Not restarting again: "
+                            "a restart didn't clear it, so it may be an update type the bot "
+                            "doesn't subscribe to. Healthcheck pings stay off so the owner is "
+                            "alerted.",
+                            health.last_problem,
+                        )
+                        holding_logged = True
+                    continue
+                if delivery_stall:
+                    health.record_stall_restart()
                 logger.critical(
                     "Telegram connectivity unhealthy for %.0fs (last problem: %s). Exiting with "
                     "code %d so the platform restarts the bot.",
