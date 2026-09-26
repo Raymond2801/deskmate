@@ -42,14 +42,16 @@ class FakeClock:
 
 
 class FakeHttpClient:
-    def __init__(self) -> None:
+    def __init__(self, body: str = "OK") -> None:
         self.ping_times: list[float] = []
         self.clock: FakeClock | None = None
+        self.body = body
 
     async def get(self, url, timeout=None):
         self.ping_times.append(self.clock())
         response = mock.Mock()
         response.raise_for_status = mock.Mock()
+        response.text = self.body
         return response
 
 
@@ -383,6 +385,41 @@ class FilteredUpdateFalsePositiveTests(unittest.TestCase):
         self.assertEqual(polling_health.last_problem_kind, health.PROBLEM_DELIVERY_STALL)
         # From here the loop is frozen: nothing calls evaluate() any more.
         self.assertEqual(run_watchdog(polling_health, clock, lambda: None), [health.WATCHDOG_EXIT_CODE])
+
+
+class HealthcheckResponseTests(unittest.TestCase):
+    def run_one_ping(self, body):
+        clock = FakeClock()
+        polling_health = new_health(clock)
+        polling_health.record_poll_success([])
+        client = FakeHttpClient(body)
+        client.clock = clock
+        calls = {"n": 0}
+
+        async def fake_sleep(seconds):
+            if calls["n"]:
+                raise asyncio.CancelledError
+            calls["n"] += 1
+
+        async def main():
+            with mock.patch.object(health.asyncio, "sleep", fake_sleep):
+                try:
+                    await health.heartbeat_loop(polling_health, client, "https://hc.example/ping")
+                except asyncio.CancelledError:
+                    pass
+
+        with self.assertLogs("deskmate.health", level="INFO") as logs:
+            asyncio.run(main())
+        return logs.output
+
+    def test_unknown_uuid_is_reported_not_logged_as_sent(self):
+        output = self.run_one_ping("OK (not found)")
+        self.assertTrue(any("not recorded by the server: OK (not found)" in line for line in output))
+        self.assertFalse(any("Healthcheck ping sent." in line for line in output))
+
+    def test_plain_ok_is_logged_as_sent(self):
+        output = self.run_one_ping("OK")
+        self.assertTrue(any("Healthcheck ping sent." in line for line in output))
 
 
 class QueueStallTests(unittest.TestCase):

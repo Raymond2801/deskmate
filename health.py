@@ -256,7 +256,13 @@ async def heartbeat_loop(health: PollingHealth, client: httpx.AsyncClient, ping_
         try:
             response = await client.get(ping_url, timeout=HEALTHCHECK_REQUEST_TIMEOUT_SECONDS)
             response.raise_for_status()
-            logger.info("Healthcheck ping sent.")
+            body = response.text.strip()
+            # healthchecks.io answers 200 even for a UUID it doesn't know, with
+            # "OK (not found)" (or "OK (rate limited)") in the body.
+            if body.startswith("OK (") and body != "OK":
+                logger.warning("Healthcheck ping not recorded by the server: %s", body[:60])
+            else:
+                logger.info("Healthcheck ping sent.")
         except Exception as exc:  # noqa: BLE001
             logger.warning("Healthcheck ping failed: %s", type(exc).__name__)
 
