@@ -21,8 +21,9 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from telegram.error import NetworkError  # noqa: E402
+from telegram.error import Conflict, NetworkError, TimedOut  # noqa: E402
 from telegram.ext import ExtBot  # noqa: E402
+from telegram.request import HTTPXRequest  # noqa: E402
 
 import health  # noqa: E402
 from bot import HeartbeatBot  # noqa: E402
@@ -65,8 +66,12 @@ def new_health(clock, marker_name: str | None = None) -> health.PollingHealth:
     return health.PollingHealth(clock=clock, stall_marker=Path(_marker_dir.name) / name)
 
 
-def make_bot(polling_health: health.PollingHealth) -> HeartbeatBot:
-    return HeartbeatBot(token="123456:TEST-not-a-real-token", polling_health=polling_health)
+def make_bot(polling_health: health.PollingHealth, get_updates_request=None) -> HeartbeatBot:
+    return HeartbeatBot(
+        token="123456:TEST-not-a-real-token",
+        polling_health=polling_health,
+        get_updates_request=get_updates_request or HTTPXRequest(connection_pool_size=1),
+    )
 
 
 async def poll_once(bot: HeartbeatBot) -> None:
@@ -118,6 +123,75 @@ class HeartbeatBotTests(unittest.TestCase):
         with mock.patch.object(ExtBot, "get_updates", return_value=[]):
             asyncio.run(poll_once(bot))
         self.assertEqual(polling_health.last_poll_success, clock.now)
+
+
+class ConnectionResetTests(unittest.TestCase):
+    """After a NetworkError the getUpdates client is rebuilt, so the retry
+    can't reuse a keep-alive connection to a bad Telegram frontend."""
+
+    def make_bot_with_fake_request(self):
+        request = mock.Mock(spec=HTTPXRequest)
+        request.shutdown = mock.AsyncMock()
+        request.initialize = mock.AsyncMock()
+        return make_bot(new_health(FakeClock()), get_updates_request=request), request
+
+    def call_get_updates(self, bot, side_effect):
+        async def run():
+            with mock.patch.object(ExtBot, "get_updates", side_effect=side_effect):
+                return await bot.get_updates(timeout=health.POLL_TIMEOUT_SECONDS)
+        return asyncio.run(run())
+
+    def test_bad_gateway_resets_connection_and_still_raises(self):
+        bot, request = self.make_bot_with_fake_request()
+        with self.assertRaises(NetworkError):
+            self.call_get_updates(bot, NetworkError("Bad Gateway"))
+        request.shutdown.assert_awaited_once()
+        request.initialize.assert_awaited_once()
+        self.assertLess(
+            request.method_calls.index(mock.call.shutdown()), request.method_calls.index(mock.call.initialize())
+        )
+
+    def test_timeout_also_resets_connection(self):
+        bot, request = self.make_bot_with_fake_request()
+        with self.assertRaises(TimedOut):
+            self.call_get_updates(bot, TimedOut())
+        request.initialize.assert_awaited_once()
+
+    def test_success_does_not_reset_connection(self):
+        bot, request = self.make_bot_with_fake_request()
+        self.assertEqual(self.call_get_updates(bot, None), mock.ANY)
+        request.shutdown.assert_not_awaited()
+
+    def test_conflict_does_not_reset_connection(self):
+        # Conflict (a second poller during a redeploy) is not a network fault.
+        bot, request = self.make_bot_with_fake_request()
+        with self.assertRaises(Conflict):
+            self.call_get_updates(bot, Conflict("terminated by other getUpdates request"))
+        request.shutdown.assert_not_awaited()
+
+    def test_failed_reset_does_not_hide_the_original_error(self):
+        bot, request = self.make_bot_with_fake_request()
+        request.initialize.side_effect = RuntimeError("boom")
+        with self.assertRaises(NetworkError):
+            self.call_get_updates(bot, NetworkError("Bad Gateway"))
+
+    def test_real_httpx_request_gets_a_new_client(self):
+        request = HTTPXRequest(connection_pool_size=1)
+        bot = make_bot(new_health(FakeClock()), get_updates_request=request)
+
+        async def run():
+            await request.initialize()
+            old_client = request._client
+            with mock.patch.object(ExtBot, "get_updates", side_effect=NetworkError("Bad Gateway")):
+                with self.assertRaises(NetworkError):
+                    await bot.get_updates()
+            new_client = request._client
+            self.assertIsNot(new_client, old_client)
+            self.assertTrue(old_client.is_closed)
+            self.assertFalse(new_client.is_closed)
+            await request.shutdown()
+
+        asyncio.run(run())
 
 
 class BadGatewayTests(unittest.TestCase):

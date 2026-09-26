@@ -10,6 +10,11 @@ Modes:
   always-502                 HTTP 502 on every call, including startup.
   pending-not-delivered      getUpdates always returns [] while getWebhookInfo
                              reports pending updates (the 2026-09-26 shape).
+  bad-gateway-burst          getUpdates calls #4 and #5 get HTTP 502, all else
+                             is healthy. Each getUpdates logs the client port,
+                             so a changed port shows a new connection.
+
+Speaks HTTP/1.1 with keep-alive, like Telegram, so connection reuse is real.
 
 Run: .venv/bin/python tests/fake_telegram_server.py --port 8799 --mode bad-gateway-after --seconds 30
 """
@@ -17,7 +22,9 @@ Run: .venv/bin/python tests/fake_telegram_server.py --port 8799 --mode bad-gatew
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
+import threading
 import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,8 +36,16 @@ def log(message: str) -> None:
     print(f"{datetime.now():%Y-%m-%d %H:%M:%S} [fake-telegram] {message}", flush=True)
 
 
+BURST_FAILING_CALLS = {4, 5}
+
+
 def make_handler(mode: str, healthy_seconds: float, started_at: float):
+    get_updates_counter = itertools.count(1)
+    counter_lock = threading.Lock()
+
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
         def log_message(self, *args) -> None:  # silence default access log (it has the token)
             pass
 
@@ -58,6 +73,11 @@ def make_handler(mode: str, healthy_seconds: float, started_at: float):
             broken = mode == "always-502" or (
                 mode == "bad-gateway-after" and time.monotonic() - started_at > healthy_seconds
             )
+            if method == "getUpdates" and mode == "bad-gateway-burst":
+                with counter_lock:
+                    call_number = next(get_updates_counter)
+                broken = call_number in BURST_FAILING_CALLS
+                log(f"getUpdates #{call_number} from client port {self.client_address[1]}")
             if broken:
                 log(f"{method} -> 502 Bad Gateway")
                 # Same body Telegram sends, so PTB raises NetworkError("Bad Gateway")
@@ -88,7 +108,7 @@ def make_handler(mode: str, healthy_seconds: float, started_at: float):
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8799)
-    parser.add_argument("--mode", choices=["bad-gateway-after", "always-502", "pending-not-delivered"], required=True)
+    parser.add_argument("--mode", choices=["bad-gateway-after", "always-502", "pending-not-delivered", "bad-gateway-burst"], required=True)
     parser.add_argument("--seconds", type=float, default=30, help="healthy phase for bad-gateway-after")
     args = parser.parse_args()
 

@@ -10,7 +10,8 @@ from pathlib import Path
 import httpx
 from telegram import Update
 from telegram.constants import ChatAction
-from telegram.error import Conflict
+from telegram.error import Conflict, NetworkError
+from telegram.request import BaseRequest
 from telegram.ext import Application, CommandHandler, ContextTypes, ExtBot, MessageHandler, TypeHandler, filters
 from telegram.request import HTTPXRequest
 
@@ -86,16 +87,44 @@ UNSUPPORTED_FILE_MESSAGE = (
 class HeartbeatBot(ExtBot):
     """ExtBot subclass that records every getUpdates call that returns
     successfully, empty or not, in PollingHealth. A call that raises records
-    nothing. See health.py for why this alone isn't proof of a working bot."""
+    nothing. See health.py for why this alone isn't proof of a working bot.
 
-    def __init__(self, *args, polling_health: health.PollingHealth, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    After a NetworkError (which includes Bad Gateway and TimedOut) it also
+    throws away the getUpdates HTTP client, so PTB's retry opens a brand-new
+    connection instead of reusing a keep-alive one that may be stuck to a bad
+    Telegram frontend. A process restart, which also means a new connection,
+    is what fixed the 2026-09-26 incident. Only the polling task uses this
+    request object, one call at a time, so closing it here can't cut off a
+    call in flight."""
+
+    def __init__(
+        self,
+        *args,
+        polling_health: health.PollingHealth,
+        get_updates_request: BaseRequest,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, get_updates_request=get_updates_request, **kwargs)
         self._polling_health = polling_health
+        self._get_updates_request = get_updates_request
 
     async def get_updates(self, *args, **kwargs):
-        result = await super().get_updates(*args, **kwargs)
+        try:
+            result = await super().get_updates(*args, **kwargs)
+        except NetworkError:
+            await self._reset_get_updates_connection()
+            raise
         self._polling_health.record_poll_success(result)
         return result
+
+    async def _reset_get_updates_connection(self) -> None:
+        try:
+            await self._get_updates_request.shutdown()
+            await self._get_updates_request.initialize()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not reset the getUpdates connection: %s", type(exc).__name__)
+            return
+        logger.info("Reset the getUpdates connection after a network error; the next poll opens a new one.")
 
 
 def _telegram_request(connection_pool_size: int) -> HTTPXRequest:
