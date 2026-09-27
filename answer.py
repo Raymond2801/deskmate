@@ -20,6 +20,33 @@ API_TIMEOUT_SECONDS = 60
 
 API_UNREACHABLE_MESSAGE = "I could not reach the language model. Please try again in a moment."
 
+# Anthropic has no dedicated error code for an over-long prompt; it returns a
+# 400 invalid_request_error whose message starts with this text. If the wording
+# ever changes, the bot falls back to API_UNREACHABLE_MESSAGE, as before.
+PROMPT_TOO_LONG_PREFIX = "prompt is too long"
+
+
+class LibraryTooLarge(Exception):
+    """The documents plus the question no longer fit in the model's context
+    window, so no question can be answered until documents are removed.
+    `detail` is Anthropic's own message, e.g. "prompt is too long: 1060682
+    tokens > 1000000 maximum"."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+def _prompt_too_long_detail(exc: Exception) -> str | None:
+    if not isinstance(exc, anthropic.BadRequestError):
+        return None
+    body = exc.body if isinstance(exc.body, dict) else {}
+    error = body.get("error") if isinstance(body.get("error"), dict) else {}
+    message = str(error.get("message") or "")
+    if message.startswith(PROMPT_TOO_LONG_PREFIX):
+        return message
+    return None
+
 
 def _load_system_prompt_template() -> str:
     return SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
@@ -47,7 +74,10 @@ class AnswerEngine:
     async def answer(self, question: str) -> str:
         """Answer a single question independently. No conversation history
         is sent: this is a lookup tool, not a chat, and history would let a
-        stale answer bias a later question."""
+        stale answer bias a later question.
+
+        Raises LibraryTooLarge when the documents don't fit in the model's
+        context window; every other failure returns API_UNREACHABLE_MESSAGE."""
         static_block = build_static_block(self._config, self._corpus)
 
         loop = asyncio.get_running_loop()
@@ -57,6 +87,11 @@ class AnswerEngine:
                 timeout=API_TIMEOUT_SECONDS,
             )
         except Exception as exc:  # noqa: BLE001 - any API failure must fall back safely
+            detail = _prompt_too_long_detail(exc)
+            if detail is not None:
+                logger.error("Document library is too large for the model: %s", detail)
+                doctor.record_last_error(f"Document library too large for the model: {detail}")
+                raise LibraryTooLarge(detail) from exc
             logger.error("Anthropic API call failed: %s", exc)
             doctor.record_last_error(f"Anthropic API call failed: {exc}")
             return API_UNREACHABLE_MESSAGE

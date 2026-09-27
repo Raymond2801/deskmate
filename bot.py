@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -18,7 +19,7 @@ from telegram.request import HTTPXRequest
 import doctor
 import health
 import ingest
-from answer import AnswerEngine
+from answer import AnswerEngine, LibraryTooLarge
 from config import Config, load_config
 from corpus import Corpus, CorpusFull
 
@@ -60,6 +61,9 @@ class RedactSecretsFilter(logging.Filter):
 
 DEBOUNCE_SECONDS = 3
 ANSWER_TIMEOUT_SECONDS = 65  # slightly above answer.API_TIMEOUT_SECONDS as a hard backstop
+# Every question fails while the library is too large; tell the admin once
+# an hour, not once per question.
+LIBRARY_ALERT_INTERVAL_SECONDS = 3600
 
 GREETING = (
     "Hi, I'm {company_name}'s policy assistant. Ask me a question about "
@@ -76,6 +80,17 @@ NO_DOCUMENTS_MESSAGE = (
 FILE_REJECTED_NON_ADMIN = (
     "Thanks, but only your manager can upload documents here. Please pass "
     "this file to them."
+)
+
+LIBRARY_TOO_LARGE_STAFF_MESSAGE = (
+    "The document library is too large for the bot to read. Please ask your "
+    "admin to remove some documents."
+)
+
+LIBRARY_TOO_LARGE_ADMIN_MESSAGE = (
+    "Deskmate can't answer any questions right now: your documents are too "
+    "large for the AI model to read in one go ({detail}). Remove some "
+    "documents to fix this. Send /docs to see what's uploaded."
 )
 
 UNSUPPORTED_FILE_MESSAGE = (
@@ -143,6 +158,7 @@ class BotState:
         self.corpus = corpus
         self.answer_engine = AnswerEngine(config, corpus)
         self.pending_buffers: dict[tuple[int, int], dict] = {}
+        self.last_library_alert: float | None = None
 
 
 def _is_allowed_chat(state: BotState, chat_id: int) -> bool:
@@ -255,14 +271,44 @@ async def _answer_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             await asyncio.sleep(4)  # Telegram's typing indicator expires after ~5s
 
     typing_task = asyncio.create_task(_keep_typing())
+    library_too_large: LibraryTooLarge | None = None
     try:
         response = await asyncio.wait_for(state.answer_engine.answer(question), timeout=ANSWER_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
         response = "I could not reach the language model. Please try again in a moment."
+    except LibraryTooLarge as exc:
+        library_too_large = exc
+        response = LIBRARY_TOO_LARGE_STAFF_MESSAGE
     finally:
         typing_task.cancel()
 
+    if library_too_large is not None and chat_id == state.config.admin_user_id:
+        # The admin asked in their own DM: give them the real cause directly
+        # instead of a message telling them to ask themselves.
+        await context.bot.send_message(
+            chat_id=chat_id, text=LIBRARY_TOO_LARGE_ADMIN_MESSAGE.format(detail=library_too_large.detail)
+        )
+        state.last_library_alert = time.monotonic()
+        return
+
     await context.bot.send_message(chat_id=chat_id, text=response)
+    if library_too_large is not None:
+        await _alert_admin_library_too_large(context, state, library_too_large)
+
+
+async def _alert_admin_library_too_large(
+    context: ContextTypes.DEFAULT_TYPE, state: BotState, exc: LibraryTooLarge
+) -> None:
+    now = time.monotonic()
+    if state.last_library_alert is not None and now - state.last_library_alert < LIBRARY_ALERT_INTERVAL_SECONDS:
+        return
+    state.last_library_alert = now
+    try:
+        await context.bot.send_message(
+            chat_id=state.config.admin_user_id, text=LIBRARY_TOO_LARGE_ADMIN_MESSAGE.format(detail=exc.detail)
+        )
+    except Exception as send_exc:  # noqa: BLE001 - the staff reply already went out
+        logger.warning("Could not alert the admin that the library is too large: %s", send_exc)
 
 
 async def _flush_after_delay(key: tuple[int, int], context: ContextTypes.DEFAULT_TYPE, state: BotState) -> None:
