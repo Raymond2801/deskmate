@@ -18,6 +18,11 @@ DOCS_DIR = DATA_DIR / "docs"
 ARCHIVE_DIR = DATA_DIR / "archive"
 CORPUS_FILE = DATA_DIR / "corpus.json"
 DEMO_DOCS_DIR = Path("demo-corpus") / "docs"
+# Written once the library has held real documents, or once any document has
+# been removed. From then on an empty library stays empty: the demo documents
+# (a fictional company's policies, cited like real ones) are never seeded
+# again, so a restart can't start answering real staff from them.
+LIBRARY_STARTED_MARKER = DATA_DIR / "library_started"
 
 
 @dataclass
@@ -65,12 +70,19 @@ class Corpus:
 
         corpus = cls()
 
-        if not any(DOCS_DIR.iterdir()) and DEMO_DOCS_DIR.exists():
+        library_started = LIBRARY_STARTED_MARKER.exists()
+        if not any(DOCS_DIR.iterdir()) and DEMO_DOCS_DIR.exists() and not library_started:
             corpus._seed_demo_corpus()
         elif CORPUS_FILE.exists():
             corpus._load_from_disk()
         else:
             corpus._rebuild_from_docs_dir()
+
+        if library_started and len(corpus) == 0:
+            logger.info("The document library is empty; not re-seeding the demo documents.")
+        if any(doc.source == "upload" for doc in corpus._documents.values()):
+            # Covers deployments that had real documents before the marker existed.
+            _mark_library_started()
 
         return corpus
 
@@ -140,6 +152,7 @@ class Corpus:
         )
         self._documents[filename] = doc
         self.save()
+        _mark_library_started()
         return doc
 
     def _archive_existing(self, filename: str) -> None:
@@ -151,6 +164,27 @@ class Corpus:
             shutil.move(str(existing_path), str(archived_path))
             logger.info("Archived previous %s to %s", filename, archived_path)
 
+    def find(self, name: str) -> list[str]:
+        """Filenames matching `name`: the exact filename if there is one,
+        otherwise every filename equal to it ignoring case (more than one
+        only when two uploads differ by case alone)."""
+        name = name.strip()
+        if name in self._documents:
+            return [name]
+        lowered = name.lower()
+        return sorted(f for f in self._documents if f.lower() == lowered)
+
+    def remove_document(self, filename: str) -> Document:
+        """Stop using a document for answers. The file is moved to the
+        archive, like /reset_demo does, so it can still be recovered from
+        the volume. Raises KeyError if the document isn't in the corpus."""
+        doc = self._documents[filename]
+        self._archive_existing(filename)
+        del self._documents[filename]
+        self.save()
+        _mark_library_started()
+        return doc
+
     def reset_demo(self) -> list[str]:
         """Remove documents that came from the shipped demo corpus. Returns
         the list of filenames removed."""
@@ -161,7 +195,16 @@ class Corpus:
                 del self._documents[filename]
                 removed.append(filename)
         self.save()
+        if removed:
+            _mark_library_started()
         return removed
+
+
+def _mark_library_started() -> None:
+    try:
+        LIBRARY_STARTED_MARKER.touch()
+    except OSError as exc:
+        logger.warning("Could not write %s: %s", LIBRARY_STARTED_MARKER, exc)
 
 
 def _now_iso() -> str:

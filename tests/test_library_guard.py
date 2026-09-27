@@ -88,7 +88,7 @@ class ReplyFlowTests(unittest.TestCase):
         state = mock.Mock()
         state.config = make_config()
         state.corpus = FakeCorpus()
-        state.last_library_alert = None
+        state.admin_alert_sent_at = {}
         state.answer_engine.answer = mock.AsyncMock(side_effect=answer_side_effect)
         return state
 
@@ -115,7 +115,7 @@ class ReplyFlowTests(unittest.TestCase):
         sent = self.ask(state, STAFF_CHAT_ID)
         self.assertEqual(sent, [(STAFF_CHAT_ID, bot.LIBRARY_TOO_LARGE_STAFF_MESSAGE)])
 
-        state.last_library_alert -= bot.LIBRARY_ALERT_INTERVAL_SECONDS + 1
+        state.admin_alert_sent_at[bot.ALERT_LIBRARY_TOO_LARGE] -= bot.LIBRARY_ALERT_INTERVAL_SECONDS + 1
         sent = self.ask(state, STAFF_CHAT_ID)
         self.assertEqual([chat for chat, _ in sent], [STAFF_CHAT_ID, ADMIN_ID])
 

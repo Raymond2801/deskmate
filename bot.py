@@ -4,16 +4,26 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import sys
 import time
 from pathlib import Path
 
 import httpx
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.error import Conflict, NetworkError
 from telegram.request import BaseRequest
-from telegram.ext import Application, CommandHandler, ContextTypes, ExtBot, MessageHandler, TypeHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ExtBot,
+    MessageHandler,
+    TypeHandler,
+    filters,
+)
 from telegram.request import HTTPXRequest
 
 import doctor
@@ -61,9 +71,13 @@ class RedactSecretsFilter(logging.Filter):
 
 DEBOUNCE_SECONDS = 3
 ANSWER_TIMEOUT_SECONDS = 65  # slightly above answer.API_TIMEOUT_SECONDS as a hard backstop
-# Every question fails while the library is too large; tell the admin once
-# an hour, not once per question.
+# While the library is too large (or empty) every question fails the same
+# way; tell the admin once an hour per problem, not once per question.
 LIBRARY_ALERT_INTERVAL_SECONDS = 3600
+ALERT_LIBRARY_TOO_LARGE = "library_too_large"
+ALERT_LIBRARY_EMPTY = "library_empty"
+REMOVE_CONFIRM_SECONDS = 120
+REMOVE_CALLBACK_PREFIX = "rm"
 
 GREETING = (
     "Hi, I'm {company_name}'s policy assistant. Ask me a question about "
@@ -75,6 +89,12 @@ GREETING = (
 NO_DOCUMENTS_MESSAGE = (
     "No documents have been uploaded yet, so I have nothing to answer from. "
     "Please contact your manager."
+)
+
+NO_DOCUMENTS_ADMIN_MESSAGE = (
+    "Deskmate has no documents, so it can't answer staff questions. Send your "
+    "policy documents to me in this chat as file attachments (.md, .txt, "
+    ".docx, or .pdf)."
 )
 
 FILE_REJECTED_NON_ADMIN = (
@@ -90,7 +110,8 @@ LIBRARY_TOO_LARGE_STAFF_MESSAGE = (
 LIBRARY_TOO_LARGE_ADMIN_MESSAGE = (
     "Deskmate can't answer any questions right now: your documents are too "
     "large for the AI model to read in one go ({detail}). Remove some "
-    "documents to fix this. Send /docs to see what's uploaded."
+    "documents with /remove followed by the file name, e.g. "
+    "/remove old-handbook.pdf. Send /docs to see the file names."
 )
 
 UNSUPPORTED_FILE_MESSAGE = (
@@ -158,7 +179,13 @@ class BotState:
         self.corpus = corpus
         self.answer_engine = AnswerEngine(config, corpus)
         self.pending_buffers: dict[tuple[int, int], dict] = {}
-        self.last_library_alert: float | None = None
+        # When each kind of admin alert was last sent (monotonic seconds).
+        self.admin_alert_sent_at: dict[str, float] = {}
+        # /remove confirmations waiting for a button press, keyed by a short
+        # random token (Telegram caps button data at 64 bytes, too short for
+        # some file names). In memory only: a restart drops them, and the
+        # admin just sends /remove again.
+        self.pending_removals: dict[str, dict] = {}
 
 
 def _is_allowed_chat(state: BotState, chat_id: int) -> bool:
@@ -179,7 +206,10 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def handle_docs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state: BotState = context.bot_data["state"]
     if len(state.corpus) == 0:
-        await update.message.reply_text(NO_DOCUMENTS_MESSAGE)
+        if _is_admin(state, update.effective_user.id):
+            await update.message.reply_text(NO_DOCUMENTS_ADMIN_MESSAGE)
+        else:
+            await update.message.reply_text(NO_DOCUMENTS_MESSAGE)
         return
 
     lines = ["Documents I can answer from:"]
@@ -213,6 +243,101 @@ async def handle_reset_demo(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text(
         "Removed demo documents: " + ", ".join(removed) + ". Upload your real documents when ready."
     )
+
+
+REMOVE_USAGE_MESSAGE = (
+    "Send /remove followed by the file name, e.g. /remove old-handbook.pdf. "
+    "Send /docs to see the file names."
+)
+
+
+async def handle_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state: BotState = context.bot_data["state"]
+    if not _is_admin(state, update.effective_user.id):
+        await update.message.reply_text(ADMIN_ONLY_MESSAGE)
+        return
+
+    # The whole rest of the message is the name, so names with spaces work.
+    parts = (update.message.text or "").split(maxsplit=1)
+    name = parts[1].strip() if len(parts) > 1 else ""
+    if not name:
+        await update.message.reply_text(REMOVE_USAGE_MESSAGE)
+        return
+
+    matches = state.corpus.find(name)
+    if not matches:
+        await update.message.reply_text(
+            f"I couldn't find a document called {name}. Send /docs to see the exact file names."
+        )
+        return
+    if len(matches) > 1:
+        await update.message.reply_text(
+            "More than one document matches that name: " + ", ".join(matches)
+            + ". Send /remove with the exact name, including capital letters."
+        )
+        return
+
+    filename = matches[0]
+    doc = state.corpus.get(filename)
+    now = time.monotonic()
+    for token, pending in list(state.pending_removals.items()):
+        if pending["expires_at"] <= now:
+            del state.pending_removals[token]
+    token = secrets.token_hex(4)
+    state.pending_removals[token] = {"filename": filename, "expires_at": now + REMOVE_CONFIRM_SECONDS}
+
+    keyboard = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("Remove", callback_data=f"{REMOVE_CALLBACK_PREFIX}:{token}:yes"),
+            InlineKeyboardButton("Cancel", callback_data=f"{REMOVE_CALLBACK_PREFIX}:{token}:no"),
+        ]]
+    )
+    await update.message.reply_text(
+        f"Remove {filename} ({doc.word_count:,} words, added {doc.ingested_at.split('T')[0]})? "
+        "The bot will stop using it for answers. This request expires in 2 minutes.",
+        reply_markup=keyboard,
+    )
+
+
+async def handle_remove_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state: BotState = context.bot_data["state"]
+    query = update.callback_query
+
+    # Buttons are visible to everyone in a group; only the admin's press counts.
+    if not _is_admin(state, query.from_user.id):
+        await query.answer(ADMIN_ONLY_MESSAGE, show_alert=True)
+        return
+
+    _, token, choice = (query.data or "::").split(":", 2)
+    pending = state.pending_removals.pop(token, None)
+    if pending is None or pending["expires_at"] <= time.monotonic():
+        await query.answer()
+        await query.edit_message_text("This request has expired. Send /remove again.")
+        return
+
+    filename = pending["filename"]
+    await query.answer()
+    if choice != "yes":
+        await query.edit_message_text(f"Cancelled. {filename} was not removed.")
+        return
+
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, state.corpus.remove_document, filename)
+    except KeyError:
+        await query.edit_message_text(f"{filename} was already removed.")
+        return
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Removing %s failed: %s", filename, exc)
+        doctor.record_last_error(f"Removing {filename} failed: {exc}")
+        await query.edit_message_text(f"I couldn't remove {filename}. Please try again.")
+        return
+
+    remaining = len(state.corpus)
+    message = f"Removed {filename}. {remaining} document{'s' if remaining != 1 else ''} left."
+    if remaining == 0:
+        message += " The bot can't answer questions until you upload documents."
+    await query.edit_message_text(message)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -262,7 +387,12 @@ async def _answer_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     chat_id = update.effective_chat.id
 
     if len(state.corpus) == 0:
+        if chat_id == state.config.admin_user_id:
+            await context.bot.send_message(chat_id=chat_id, text=NO_DOCUMENTS_ADMIN_MESSAGE)
+            state.admin_alert_sent_at[ALERT_LIBRARY_EMPTY] = time.monotonic()
+            return
         await context.bot.send_message(chat_id=chat_id, text=NO_DOCUMENTS_MESSAGE)
+        await _alert_admin(context, state, ALERT_LIBRARY_EMPTY, NO_DOCUMENTS_ADMIN_MESSAGE)
         return
 
     async def _keep_typing() -> None:
@@ -288,27 +418,32 @@ async def _answer_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await context.bot.send_message(
             chat_id=chat_id, text=LIBRARY_TOO_LARGE_ADMIN_MESSAGE.format(detail=library_too_large.detail)
         )
-        state.last_library_alert = time.monotonic()
+        state.admin_alert_sent_at[ALERT_LIBRARY_TOO_LARGE] = time.monotonic()
         return
 
     await context.bot.send_message(chat_id=chat_id, text=response)
     if library_too_large is not None:
-        await _alert_admin_library_too_large(context, state, library_too_large)
-
-
-async def _alert_admin_library_too_large(
-    context: ContextTypes.DEFAULT_TYPE, state: BotState, exc: LibraryTooLarge
-) -> None:
-    now = time.monotonic()
-    if state.last_library_alert is not None and now - state.last_library_alert < LIBRARY_ALERT_INTERVAL_SECONDS:
-        return
-    state.last_library_alert = now
-    try:
-        await context.bot.send_message(
-            chat_id=state.config.admin_user_id, text=LIBRARY_TOO_LARGE_ADMIN_MESSAGE.format(detail=exc.detail)
+        await _alert_admin(
+            context,
+            state,
+            ALERT_LIBRARY_TOO_LARGE,
+            LIBRARY_TOO_LARGE_ADMIN_MESSAGE.format(detail=library_too_large.detail),
         )
-    except Exception as send_exc:  # noqa: BLE001 - the staff reply already went out
-        logger.warning("Could not alert the admin that the library is too large: %s", send_exc)
+
+
+async def _alert_admin(context: ContextTypes.DEFAULT_TYPE, state: BotState, kind: str, text: str) -> None:
+    """DM the admin about a problem staff just hit, at most once an hour per
+    kind of problem. A failure here is logged, never raised: the staff reply
+    has already gone out."""
+    now = time.monotonic()
+    last_sent = state.admin_alert_sent_at.get(kind)
+    if last_sent is not None and now - last_sent < LIBRARY_ALERT_INTERVAL_SECONDS:
+        return
+    state.admin_alert_sent_at[kind] = now
+    try:
+        await context.bot.send_message(chat_id=state.config.admin_user_id, text=text)
+    except Exception as send_exc:  # noqa: BLE001
+        logger.warning("Could not send the admin a %s alert: %s", kind, send_exc)
 
 
 async def _flush_after_delay(key: tuple[int, int], context: ContextTypes.DEFAULT_TYPE, state: BotState) -> None:
@@ -432,6 +567,8 @@ def main() -> None:
     application.add_handler(CommandHandler("docs", handle_docs))
     application.add_handler(CommandHandler("doctor", handle_doctor))
     application.add_handler(CommandHandler("reset_demo", handle_reset_demo))
+    application.add_handler(CommandHandler("remove", handle_remove))
+    application.add_handler(CallbackQueryHandler(handle_remove_button, pattern=rf"^{REMOVE_CALLBACK_PREFIX}:"))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_error_handler(handle_error)
