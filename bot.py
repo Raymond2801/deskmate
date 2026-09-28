@@ -4,13 +4,26 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import secrets
 import sys
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 import httpx
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+    ForceReply,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    MessageEntity,
+    Update,
+)
+from telegram.constants import ChatType
 from telegram.constants import ChatAction
 from telegram.error import Conflict, NetworkError
 from telegram.request import BaseRequest
@@ -30,7 +43,7 @@ import doctor
 import health
 import ingest
 import library_size
-from answer import AnswerEngine, LibraryTooLarge, build_static_block
+from answer import API_UNREACHABLE_MESSAGE, AnswerEngine, LibraryTooLarge, PreviousExchange, build_static_block
 from config import Config, load_config
 from corpus import Corpus, CorpusFull
 
@@ -82,14 +95,38 @@ REMOVE_CONFIRM_SECONDS = 120
 # its buttons (double tap, or Telegram resending while a large file was
 # being removed) is recognised instead of overwriting the result.
 REMOVE_FINISHED_MEMORY_SECONDS = 600
+REMEMBERED_MESSAGES = 500
+ANSWER_FIRST_LINE_PREFIX = "Answer:"
 REMOVE_CALLBACK_PREFIX = "rm"
 
 GREETING = (
     "Hi, I'm {company_name}'s policy assistant. Ask me a question about "
     "company policy and I'll answer from our internal documents, with a "
     "source cited. If I can't find something in the documents, I'll say so "
-    "rather than guess. Want a document added? Contact your manager."
+    "rather than guess. Want a document added? Contact your manager.\n\n"
+    "In a group chat, tap / and choose /ask, then reply to my question with "
+    "yours. To ask a follow-up, reply to one of my answers. I only read "
+    "messages sent directly to me."
 )
+
+# Only reachable when group privacy is off (Telegram doesn't deliver
+# mentions to a bot with privacy on), so it points at /ask instead.
+GROUP_EMPTY_QUESTION_MESSAGE = "Tap / and choose /ask, then reply to my question with yours."
+
+# ForceReply doesn't open the reply box on its own in every Telegram app
+# (not on Telegram Web or the phone app we tested), and with group privacy
+# on a plain message never reaches the bot, so say how to reply.
+ASK_PROMPT_MESSAGE = "What's your question? Reply to this message (tap and hold → Reply) and type it."
+
+STAFF_COMMANDS = [
+    BotCommand("ask", "Ask a policy question"),
+    BotCommand("docs", "List the documents I answer from"),
+]
+ADMIN_COMMANDS = STAFF_COMMANDS + [
+    BotCommand("remove", "Remove a document"),
+    BotCommand("reset_demo", "Remove the demo documents"),
+    BotCommand("doctor", "Diagnostic report"),
+]
 
 NO_DOCUMENTS_MESSAGE = (
     "No documents have been uploaded yet, so I have nothing to answer from. "
@@ -168,6 +205,20 @@ class HeartbeatBot(ExtBot):
         logger.info("Reset the getUpdates connection after a network error; the next poll opens a new one.")
 
 
+async def _register_commands(application: Application, admin_user_id: int) -> None:
+    """Fill the "/" menu: /ask and /docs for everyone, plus the admin
+    commands in the admin's own chat. A failure only affects the menu."""
+    try:
+        await application.bot.set_my_commands(STAFF_COMMANDS, scope=BotCommandScopeDefault())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not register the bot's commands: %s", exc)
+    try:
+        await application.bot.set_my_commands(ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=admin_user_id))
+    except Exception as exc:  # noqa: BLE001
+        # Normal until the admin has messaged the bot once.
+        logger.info("Could not register the admin command menu yet: %s", exc)
+
+
 def _telegram_request(connection_pool_size: int) -> HTTPXRequest:
     return HTTPXRequest(
         connection_pool_size=connection_pool_size,
@@ -192,6 +243,14 @@ class BotState:
         # admin just sends /remove again.
         self.pending_removals: dict[str, dict] = {}
         self.finished_removals: dict[str, float] = {}
+        # Recent bot answers, (chat_id, message_id) -> the question asked, so a
+        # reply to an answer can be sent with that exchange as context. And
+        # the "What's your question?" prompts /ask sends, so a reply to one
+        # is treated as a fresh question. Both are in memory and capped; after
+        # a restart a reply to an older answer still gets the answer text
+        # (Telegram includes it), just not the original question.
+        self.answer_questions: OrderedDict[tuple[int, int], str] = OrderedDict()
+        self.question_prompts: OrderedDict[tuple[int, int], None] = OrderedDict()
 
 
 def _is_allowed_chat(state: BotState, chat_id: int) -> bool:
@@ -206,7 +265,9 @@ def _is_admin(state: BotState, user_id: int) -> bool:
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state: BotState = context.bot_data["state"]
-    await update.message.reply_text(GREETING.format(company_name=state.config.company_name))
+    await update.message.reply_text(
+        GREETING.format(company_name=state.config.company_name, bot_username=context.bot.username)
+    )
 
 
 async def handle_docs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -433,7 +494,20 @@ async def _send_library_size_report(update: Update, state: BotState) -> None:
         logger.warning("Could not send the library size report: %s", exc)
 
 
-async def _answer_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, state: BotState, question: str) -> None:
+def _remember(store: OrderedDict, key: tuple[int, int], value) -> None:
+    store[key] = value
+    store.move_to_end(key)
+    while len(store) > REMEMBERED_MESSAGES:
+        store.popitem(last=False)
+
+
+async def _answer_and_reply(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    state: BotState,
+    question: str,
+    previous: PreviousExchange | None = None,
+) -> None:
     chat_id = update.effective_chat.id
 
     if len(state.corpus) == 0:
@@ -453,7 +527,9 @@ async def _answer_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     typing_task = asyncio.create_task(_keep_typing())
     library_too_large: LibraryTooLarge | None = None
     try:
-        response = await asyncio.wait_for(state.answer_engine.answer(question), timeout=ANSWER_TIMEOUT_SECONDS)
+        response = await asyncio.wait_for(
+            state.answer_engine.answer(question, previous=previous), timeout=ANSWER_TIMEOUT_SECONDS
+        )
     except asyncio.TimeoutError:
         response = "I could not reach the language model. Please try again in a moment."
     except LibraryTooLarge as exc:
@@ -471,7 +547,11 @@ async def _answer_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         state.admin_alert_sent_at[ALERT_LIBRARY_TOO_LARGE] = time.monotonic()
         return
 
-    await context.bot.send_message(chat_id=chat_id, text=response)
+    sent = await context.bot.send_message(chat_id=chat_id, text=response)
+    if library_too_large is None and response != API_UNREACHABLE_MESSAGE:
+        message_id = getattr(sent, "message_id", None)
+        if isinstance(message_id, int):
+            _remember(state.answer_questions, (chat_id, message_id), question)
     if library_too_large is not None:
         await _alert_admin(
             context,
@@ -503,7 +583,96 @@ async def _flush_after_delay(key: tuple[int, int], context: ContextTypes.DEFAULT
     buffer = state.pending_buffers.pop(key, None)
     if buffer is None:
         return
-    await _answer_and_reply(buffer["update"], context, state, buffer["text"])
+    await _answer_and_reply(buffer["update"], context, state, buffer["text"], previous=buffer.get("previous"))
+
+
+GROUP_CHAT_TYPES = (ChatType.GROUP, ChatType.SUPERGROUP)
+
+
+TRIGGER_PRIVATE = "private"
+TRIGGER_MENTION = "mention"
+TRIGGER_REPLY = "reply"
+TRIGGER_NONE = "none"
+
+
+def extract_question(message: Message, bot_id: int, bot_username: str) -> str | None:
+    """The question to answer, or None if this message isn't meant for the bot."""
+    return classify_message(message, bot_id, bot_username)[0]
+
+
+def classify_message(message: Message, bot_id: int, bot_username: str) -> tuple[str | None, str]:
+    """(question, trigger): the question to answer (None if this message
+    isn't meant for the bot) and what made it count (a TRIGGER_* value).
+
+    In a private chat every message is a question. In a group, only a message
+    that mentions the bot, or replies to one of the bot's messages, is; the
+    rest is people talking to each other. This check runs whatever the bot's
+    group privacy setting is: with privacy off Telegram delivers every group
+    message, and answering them all would spam the group and bill Anthropic
+    for each one."""
+    text = message.text or ""
+    if message.chat.type not in GROUP_CHAT_TYPES:
+        return text, TRIGGER_PRIVATE
+
+    replied_to = message.reply_to_message
+    is_reply_to_bot = replied_to is not None and replied_to.from_user is not None and replied_to.from_user.id == bot_id
+
+    mentioned = False
+    for entity, entity_text in message.parse_entities([MessageEntity.MENTION, MessageEntity.TEXT_MENTION]).items():
+        if entity.type == MessageEntity.MENTION and entity_text.lower() == f"@{bot_username}".lower():
+            mentioned = True
+        elif entity.type == MessageEntity.TEXT_MENTION and entity.user is not None and entity.user.id == bot_id:
+            mentioned = True
+            text = text.replace(entity_text, " ", 1)
+
+    if not (mentioned or is_reply_to_bot):
+        return None, TRIGGER_NONE
+    text = re.sub(rf"@{re.escape(bot_username)}\b", " ", text, flags=re.IGNORECASE)
+    return " ".join(text.split()), TRIGGER_MENTION if mentioned else TRIGGER_REPLY
+
+
+def previous_exchange(message: Message, state: BotState, bot_id: int) -> PreviousExchange | None:
+    """Context for a follow-up: set only when the message replies to one of
+    the bot's answers. A reply to a greeting, an error, or a "What's your
+    question?" prompt is a fresh question."""
+    replied_to = message.reply_to_message
+    if replied_to is None or replied_to.from_user is None or replied_to.from_user.id != bot_id:
+        return None
+    key = (message.chat.id, replied_to.message_id)
+    if key in state.question_prompts:
+        return None
+    answer_text = replied_to.text or ""
+    if key in state.answer_questions:
+        return PreviousExchange(question=state.answer_questions[key], answer=answer_text)
+    if answer_text.startswith(ANSWER_FIRST_LINE_PREFIX):
+        # An answer from before a restart: the question is gone, the answer isn't.
+        return PreviousExchange(question=None, answer=answer_text)
+    return None
+
+
+async def handle_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/ask <question>: works in any chat, and in a group with privacy on
+    it's how a question reaches the bot without a mention."""
+    state: BotState = context.bot_data["state"]
+    if not _is_allowed_chat(state, update.effective_chat.id):
+        return
+    parts = (update.message.text or "").split(maxsplit=1)
+    question = parts[1].strip() if len(parts) > 1 else ""
+    if not question:
+        # Picking /ask from the menu sends it straight away with no question.
+        # Ask for it with a forced reply aimed at this person only; with
+        # privacy on, Telegram delivers the reply to the bot.
+        prompt = await update.message.reply_text(
+            ASK_PROMPT_MESSAGE,
+            reply_markup=ForceReply(selective=True, input_field_placeholder="Type your question"),
+            do_quote=True,
+        )
+        message_id = getattr(prompt, "message_id", None)
+        if isinstance(message_id, int):
+            _remember(state.question_prompts, (update.effective_chat.id, message_id), None)
+        return
+    logger.info("Question received via /ask in a %s chat", update.effective_chat.type)
+    await _answer_and_reply(update, context, state, question)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -516,6 +685,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not _is_allowed_chat(state, chat_id):
         return
 
+    question, trigger = classify_message(update.message, context.bot.id, context.bot.username)
+    if update.effective_chat.type in GROUP_CHAT_TYPES:
+        # Which kind of group message arrived, never its content, so it's
+        # possible to tell "never delivered" apart from "delivered, ignored".
+        logger.info("Group message received, trigger: %s", trigger)
+    if question is None:
+        return
+    if not question:
+        await update.message.reply_text(GROUP_EMPTY_QUESTION_MESSAGE.format(bot_username=context.bot.username))
+        return
+
     # A Telegram client sometimes splits one long paste into several
     # consecutive messages. Merge them within the debounce window instead
     # of answering each fragment separately.
@@ -523,10 +703,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     buffer = state.pending_buffers.get(key)
     if buffer is not None:
         buffer["timer_task"].cancel()
-        buffer["text"] += "\n" + update.message.text
+        buffer["text"] += "\n" + question
         buffer["update"] = update
     else:
-        buffer = {"text": update.message.text, "update": update}
+        buffer = {
+            "text": question,
+            "update": update,
+            "previous": previous_exchange(update.message, state, context.bot.id),
+        }
         state.pending_buffers[key] = buffer
 
     buffer["timer_task"] = asyncio.create_task(_flush_after_delay(key, context, state))
@@ -581,6 +765,7 @@ def main() -> None:
 
     async def _start_monitoring(application: Application) -> None:
         nonlocal heartbeat_client
+        await _register_commands(application, config.admin_user_id)
         background_tasks.append(
             asyncio.create_task(health.queue_monitor_loop(polling_health, application.update_queue))
         )
@@ -615,6 +800,7 @@ def main() -> None:
     application.add_handler(TypeHandler(object, _mark_update_processed), group=-1)
     application.add_handler(CommandHandler("start", handle_start))
     application.add_handler(CommandHandler("docs", handle_docs))
+    application.add_handler(CommandHandler("ask", handle_ask))
     application.add_handler(CommandHandler("doctor", handle_doctor))
     application.add_handler(CommandHandler("reset_demo", handle_reset_demo))
     application.add_handler(CommandHandler("remove", handle_remove))

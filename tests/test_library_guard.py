@@ -83,6 +83,30 @@ class AnswerEngineTests(unittest.TestCase):
         self.assertEqual(asyncio.run(engine.answer("q")), answer.API_UNREACHABLE_MESSAGE)
 
 
+class BuildMessagesTests(unittest.TestCase):
+    def test_standalone_question(self):
+        self.assertEqual(answer.build_messages("q"), [{"role": "user", "content": "q"}])
+
+    def test_follow_up_with_remembered_question(self):
+        previous = answer.PreviousExchange(question="How long is probation?", answer="Answer: 6 months.")
+        self.assertEqual(
+            answer.build_messages("And for casuals?", previous),
+            [
+                {"role": "user", "content": "How long is probation?"},
+                {"role": "assistant", "content": "Answer: 6 months."},
+                {"role": "user", "content": "And for casuals?"},
+            ],
+        )
+
+    def test_follow_up_without_the_question_stays_one_user_turn(self):
+        previous = answer.PreviousExchange(question=None, answer="Answer: 6 months.")
+        messages = answer.build_messages("And for casuals?", previous)
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["role"], "user")
+        self.assertIn("Answer: 6 months.", messages[0]["content"])
+        self.assertTrue(messages[0]["content"].endswith("Follow-up question: And for casuals?"))
+
+
 class ReplyFlowTests(unittest.TestCase):
     def make_state(self, answer_side_effect):
         state = mock.Mock()

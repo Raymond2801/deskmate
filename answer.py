@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 import anthropic
@@ -24,6 +25,36 @@ API_UNREACHABLE_MESSAGE = "I could not reach the language model. Please try agai
 # 400 invalid_request_error whose message starts with this text. If the wording
 # ever changes, the bot falls back to API_UNREACHABLE_MESSAGE, as before.
 PROMPT_TOO_LONG_PREFIX = "prompt is too long"
+
+
+@dataclass(frozen=True)
+class PreviousExchange:
+    """The bot answer a follow-up question replies to. `question` is None
+    when the bot no longer remembers it (e.g. after a restart); the answer
+    text always comes from the replied-to Telegram message itself."""
+
+    question: str | None
+    answer: str
+
+
+def build_messages(question: str, previous: PreviousExchange | None = None) -> list[dict]:
+    if previous is None:
+        return [{"role": "user", "content": question}]
+    if previous.question is not None:
+        return [
+            {"role": "user", "content": previous.question},
+            {"role": "assistant", "content": previous.answer},
+            {"role": "user", "content": question},
+        ]
+    return [
+        {
+            "role": "user",
+            "content": (
+                "This is a follow-up to your earlier answer (the earlier question is no longer "
+                f"available):\n\n{previous.answer}\n\nFollow-up question: {question}"
+            ),
+        }
+    ]
 
 
 class LibraryTooLarge(Exception):
@@ -76,10 +107,13 @@ class AnswerEngine:
         """The Anthropic client, shared with the library size report."""
         return self._client
 
-    async def answer(self, question: str) -> str:
-        """Answer a single question independently. No conversation history
-        is sent: this is a lookup tool, not a chat, and history would let a
-        stale answer bias a later question.
+    async def answer(self, question: str, previous: PreviousExchange | None = None) -> str:
+        """Answer a question. Normally it stands alone: no conversation
+        history is sent, since this is a lookup tool, not a chat, and history
+        would let a stale answer bias a later question. The one exception is
+        `previous`, set only when someone replies to one of the bot's answers
+        to ask a follow-up: then that exchange is sent too, so "And for
+        casuals?" has something to refer to.
 
         Raises LibraryTooLarge when the documents don't fit in the model's
         context window; every other failure returns API_UNREACHABLE_MESSAGE."""
@@ -88,7 +122,7 @@ class AnswerEngine:
         loop = asyncio.get_running_loop()
         try:
             return await asyncio.wait_for(
-                loop.run_in_executor(None, self._call_api, static_block, question),
+                loop.run_in_executor(None, self._call_api, static_block, build_messages(question, previous)),
                 timeout=API_TIMEOUT_SECONDS,
             )
         except Exception as exc:  # noqa: BLE001 - any API failure must fall back safely
@@ -101,7 +135,7 @@ class AnswerEngine:
             doctor.record_last_error(f"Anthropic API call failed: {exc}")
             return API_UNREACHABLE_MESSAGE
 
-    def _call_api(self, static_block: str, question: str) -> str:
+    def _call_api(self, static_block: str, messages: list[dict]) -> str:
         message = self._client.messages.create(
             model=self._config.model,
             max_tokens=MAX_TOKENS,
@@ -112,8 +146,6 @@ class AnswerEngine:
                     "cache_control": {"type": "ephemeral"},
                 },
             ],
-            messages=[
-                {"role": "user", "content": question},
-            ],
+            messages=messages,
         )
         return "".join(block.text for block in message.content if block.type == "text")
