@@ -71,6 +71,11 @@ class AnswerEngine:
         self._corpus = corpus
         self._client = anthropic.Anthropic(api_key=config.anthropic_api_key)
 
+    @property
+    def client(self) -> anthropic.Anthropic:
+        """The Anthropic client, shared with the library size report."""
+        return self._client
+
     async def answer(self, question: str) -> str:
         """Answer a single question independently. No conversation history
         is sent: this is a lookup tool, not a chat, and history would let a

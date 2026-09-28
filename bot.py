@@ -29,7 +29,8 @@ from telegram.request import HTTPXRequest
 import doctor
 import health
 import ingest
-from answer import AnswerEngine, LibraryTooLarge
+import library_size
+from answer import AnswerEngine, LibraryTooLarge, build_static_block
 from config import Config, load_config
 from corpus import Corpus, CorpusFull
 
@@ -77,6 +78,10 @@ LIBRARY_ALERT_INTERVAL_SECONDS = 3600
 ALERT_LIBRARY_TOO_LARGE = "library_too_large"
 ALERT_LIBRARY_EMPTY = "library_empty"
 REMOVE_CONFIRM_SECONDS = 120
+# How long a finished /remove request is remembered, so a repeat press on
+# its buttons (double tap, or Telegram resending while a large file was
+# being removed) is recognised instead of overwriting the result.
+REMOVE_FINISHED_MEMORY_SECONDS = 600
 REMOVE_CALLBACK_PREFIX = "rm"
 
 GREETING = (
@@ -186,6 +191,7 @@ class BotState:
         # some file names). In memory only: a restart drops them, and the
         # admin just sends /remove again.
         self.pending_removals: dict[str, dict] = {}
+        self.finished_removals: dict[str, float] = {}
 
 
 def _is_allowed_chat(state: BotState, chat_id: int) -> bool:
@@ -309,17 +315,31 @@ async def handle_remove_button(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     _, token, choice = (query.data or "::").split(":", 2)
+    now = time.monotonic()
+    for old_token, finished_at in list(state.finished_removals.items()):
+        if now - finished_at > REMOVE_FINISHED_MEMORY_SECONDS:
+            del state.finished_removals[old_token]
+    if token in state.finished_removals:
+        logger.info("Ignored a repeat press on a finished /remove request")
+        await query.answer("Already done.")
+        return
+
     pending = state.pending_removals.pop(token, None)
-    if pending is None or pending["expires_at"] <= time.monotonic():
+    if pending is None or pending["expires_at"] <= now:
         await query.answer()
         await query.edit_message_text("This request has expired. Send /remove again.")
         return
 
+    # Mark finished before any await: a repeat press queued behind this one
+    # must see it, whatever happens next.
+    state.finished_removals[token] = now
     filename = pending["filename"]
     await query.answer()
     if choice != "yes":
+        logger.info("/remove of %s cancelled", filename)
         await query.edit_message_text(f"Cancelled. {filename} was not removed.")
         return
+    logger.info("/remove of %s confirmed", filename)
 
     try:
         loop = asyncio.get_running_loop()
@@ -381,6 +401,36 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text(
         f"Got it: {doc.filename} ingested, {doc.word_count:,} words extracted."
     )
+    await _send_library_size_report(update, state)
+
+
+LIBRARY_SIZE_TIMEOUT_SECONDS = 30
+
+
+async def _send_library_size_report(update: Update, state: BotState) -> None:
+    """Follow-up to a successful upload: total library size, estimated cost
+    per question, and a warning when either gets high. Informational only;
+    any failure here is logged and the upload stands."""
+    try:
+        static_block = build_static_block(state.config, state.corpus)
+        loop = asyncio.get_running_loop()
+        size = await asyncio.wait_for(
+            loop.run_in_executor(
+                None, library_size.measure, state.answer_engine.client, state.config.model, static_block
+            ),
+            timeout=LIBRARY_SIZE_TIMEOUT_SECONDS,
+        )
+        report = library_size.format_report(size, state.config.model, len(state.corpus))
+        logger.info(
+            "Library size after upload: %d tokens (%s), %.0f%% of %d-token context window",
+            size.tokens,
+            "counted" if size.tokens_exact else "estimated",
+            size.context_fraction * 100,
+            size.context_tokens,
+        )
+        await update.message.reply_text(report)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not send the library size report: %s", exc)
 
 
 async def _answer_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, state: BotState, question: str) -> None:

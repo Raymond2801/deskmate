@@ -177,12 +177,54 @@ class RemoveCommandTests(TempDataDir):
         self.assertIn("expired", query.edit_message_text.call_args.args[0])
         self.assertIsNotNone(self.corpus.get("Handbook.md"))
 
-    def test_second_press_after_removal_is_harmless(self):
+    def test_double_press_does_not_overwrite_the_result(self):
+        buttons = self.ask_to_remove()
+        first = self.press(buttons["Remove"])
+        self.assertEqual(first.edit_message_text.call_args.args[0], "Removed Handbook.md. 2 documents left.")
+        second = self.press(buttons["Remove"])
+        second.edit_message_text.assert_not_awaited()
+        self.assertEqual(second.answer.call_args.args[0], "Already done.")
+        self.assertEqual(len(self.corpus), 2)
+
+    def test_pressing_cancel_after_remove_does_not_overwrite_either(self):
         buttons = self.ask_to_remove()
         self.press(buttons["Remove"])
+        second = self.press(buttons["Cancel"])
+        second.edit_message_text.assert_not_awaited()
+        self.assertIsNone(self.corpus.get("Handbook.md"))
+
+    def test_repeat_press_on_a_cancelled_request_is_ignored(self):
+        buttons = self.ask_to_remove()
+        self.press(buttons["Cancel"])
+        second = self.press(buttons["Remove"])
+        second.edit_message_text.assert_not_awaited()
+        self.assertIsNotNone(self.corpus.get("Handbook.md"))
+
+    def test_repeat_press_queued_behind_a_slow_removal_is_ignored(self):
+        # The reported case: removing a large file takes a moment, and a second
+        # press is processed right after the first one finishes.
+        buttons = self.ask_to_remove()
+        original = self.corpus.remove_document
+        presses = []
+
+        def slow_remove(filename):
+            presses.append(self.press(buttons["Remove"]))  # arrives mid-removal
+            return original(filename)
+
+        with mock.patch.object(self.corpus, "remove_document", side_effect=slow_remove):
+            first = self.press(buttons["Remove"])
+        self.assertEqual(first.edit_message_text.call_args.args[0], "Removed Handbook.md. 2 documents left.")
+        presses[0].edit_message_text.assert_not_awaited()
+        self.assertEqual(presses[0].answer.call_args.args[0], "Already done.")
+
+    def test_finished_requests_are_forgotten_after_a_while(self):
+        buttons = self.ask_to_remove()
+        self.press(buttons["Remove"])
+        for token in self.state.finished_removals:
+            self.state.finished_removals[token] -= bot.REMOVE_FINISHED_MEMORY_SECONDS + 1
         query = self.press(buttons["Remove"])
         self.assertIn("expired", query.edit_message_text.call_args.args[0])
-        self.assertEqual(len(self.corpus), 2)
+        self.assertEqual(self.state.finished_removals, {})
 
     def test_document_removed_meanwhile_is_reported(self):
         buttons = self.ask_to_remove()
