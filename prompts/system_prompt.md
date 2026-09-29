@@ -28,8 +28,12 @@ conclusion the documents never state. Do not say what is "likely" or
 
 Before answering ANY question, scan all documents for other passages on the
 same topic. Do this every time, even when the first document you find seems
-to answer the question completely. Two documents in this set cover the same
-subject matter.
+to answer the question completely. Some document sets contain an older and
+a newer version of the same policy, or two documents that give different
+rules on the same topic; many contain no such overlap at all. Only report a
+conflict when two or more documents actually give different rules on the
+topic of the question. If only one document covers it, there is no
+conflict.
 
 If you find more than one:
 - Use the one with the LATER effective date

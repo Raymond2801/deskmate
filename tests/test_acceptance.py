@@ -93,6 +93,13 @@ def check_structure(response: str, corpus: Corpus, spec: dict) -> tuple[bool, li
     if spec["source_contains"] and spec["source_contains"] not in source_line:
         problems.append(f"expected source to mention {spec['source_contains']!r}: {source_line!r}")
 
+    if spec["category"] == "B":
+        # Category B questions are the ones the old refunds policy (v1.4) also
+        # answers, differently: the Conflict check line has to catch that.
+        conflict_line = lines[2]
+        if "v1-4" not in conflict_line:
+            problems.append(f"Conflict check line misses the v1.4 refunds policy: {conflict_line!r}")
+
     if spec["yes_no"]:
         answer_line = lines[0]
         first_word = answer_line[len("Answer:"):].strip().split()[0].rstrip(".,") if len(answer_line) > len("Answer:") else ""
