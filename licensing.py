@@ -247,7 +247,7 @@ class LicenseManager:
         if not self.key:
             self.state = LicenseState(key_hash="", status=STATUS_LOCKED, reason=REASON_MISSING)
             logger.info("License check: locked (missing): LICENSE_KEY is not set.")
-            return "LICENSE_KEY is not set"
+            return "LICENSE_KEY is not set."
         if self.client is None:
             raise RuntimeError("LicenseManager.client is not set")
 

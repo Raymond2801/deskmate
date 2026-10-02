@@ -453,7 +453,7 @@ class VolumeTests(TempDataDir):
 class MissingKeyTests(TempDataDir):
     def test_missing_key_locks_without_calling_gumroad(self):
         manager = self.manager("   ")
-        self.check(manager)
+        self.assertEqual(self.check(manager), "LICENSE_KEY is not set.")
         self.assertEqual(manager.lock_reason, licensing.REASON_MISSING)
         self.assertEqual(self.gumroad.requests, [])
         self.assertFalse(licensing.license_file().exists())
