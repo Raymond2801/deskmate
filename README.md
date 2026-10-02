@@ -24,6 +24,7 @@ All configuration is environment variables, validated at startup in
 | `TELEGRAM_BOT_TOKEN` | yes | From @BotFather |
 | `COMPANY_NAME` | yes | Inserted into the bot's answers |
 | `ADMIN_USER_ID` | yes | Numeric Telegram user ID; only this account can upload documents |
+| `LICENSE_KEY` | yes, to answer | Your Gumroad license key. Without a valid key the bot starts but does not answer, and tells the admin why |
 | `ALLOWED_CHAT_IDS` | no | Comma-separated chat IDs to restrict responses to; blank = any chat |
 | `MODEL` | no | Overrides the default Claude model |
 | `LOG_LEVEL` | no | `DEBUG`/`INFO`/`WARNING`/`ERROR`, default `INFO` |
@@ -53,4 +54,5 @@ lost on redeploy. Accepts `.md`, `.txt`, `.docx`, `.pdf`, up to 10MB each,
 | `/start` | everyone | A short greeting |
 | `/docs` | everyone | Lists the documents the bot can answer from |
 | `/doctor` | admin only | Diagnostic report: config status, document count, last error |
+| `/license` | admin only | Shows the license status and checks it with Gumroad again |
 | `/reset_demo` | admin only | Removes the demo documents after real ones are uploaded |
