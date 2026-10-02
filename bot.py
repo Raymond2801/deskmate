@@ -9,7 +9,9 @@ import secrets
 import sys
 import time
 from collections import OrderedDict
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 from telegram import (
@@ -29,6 +31,7 @@ from telegram.error import Conflict, NetworkError
 from telegram.request import BaseRequest
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -43,6 +46,7 @@ import doctor
 import health
 import ingest
 import library_size
+import licensing
 from answer import API_UNREACHABLE_MESSAGE, AnswerEngine, LibraryTooLarge, PreviousExchange, build_static_block
 from config import Config, load_config
 from corpus import Corpus, CorpusFull
@@ -156,6 +160,39 @@ LIBRARY_TOO_LARGE_ADMIN_MESSAGE = (
     "/remove old-handbook.pdf. Send /docs to see the file names."
 )
 
+LICENSE_LOCKED_STAFF_MESSAGE = "Deskmate is not available right now. Please contact your administrator."
+
+# What the admin is told while the bot is locked, by lock reason. Sent when
+# the bot locks, and as the reply to anything the admin sends while locked.
+LICENSE_LOCKED_ADMIN_MESSAGES = {
+    licensing.REASON_MISSING: (
+        "Deskmate is locked because no license key is set, so it is not answering anyone. "
+        "Add your Gumroad license key as the LICENSE_KEY variable in Railway, then redeploy."
+    ),
+    licensing.REASON_INVALID: (
+        "Deskmate is locked because Gumroad does not recognise the license key in LICENSE_KEY, "
+        "so it is not answering anyone. Check the key against your Gumroad receipt, fix LICENSE_KEY "
+        "in Railway and redeploy. Send /license to check again."
+    ),
+    licensing.REASON_REVOKED: (
+        "Deskmate is locked because the purchase for this license key was refunded or disputed, "
+        "so it is not answering anyone. If you think this is a mistake, contact the seller, then "
+        "send /license to check again."
+    ),
+    licensing.REASON_ACTIVATION_LIMIT: (
+        f"Deskmate is locked because this license key has been activated more than "
+        f"{licensing.MAX_ACTIVATIONS} times, so it is not answering anyone. Each purchase covers up "
+        f"to {licensing.MAX_ACTIVATIONS} activations. Ask the seller to reset the count, then send "
+        "/license to check again."
+    ),
+    licensing.REASON_UNVERIFIED: (
+        "Deskmate could not reach Gumroad to check its license yet, so it is not answering anyone. "
+        "It tries again every 15 minutes. Send /license to try now."
+    ),
+}
+# A button's popup is capped at 200 characters, so the admin gets a pointer.
+LICENSE_LOCKED_ADMIN_BUTTON_MESSAGE = "Deskmate is locked. Send /license for details."
+
 UNSUPPORTED_FILE_MESSAGE = (
     "I can only read .md, .txt, .docx, and .pdf files. Please convert this "
     "file and try again."
@@ -251,6 +288,10 @@ class BotState:
         # (Telegram includes it), just not the original question.
         self.answer_questions: OrderedDict[tuple[int, int], str] = OrderedDict()
         self.question_prompts: OrderedDict[tuple[int, int], None] = OrderedDict()
+        self.license = licensing.LicenseManager(config.license_key)
+        # The (status, reason) the admin was last alerted about, so a lock is
+        # announced once, not on every check that finds it unchanged.
+        self.license_alerted: tuple[str, str] | None = None
 
 
 def _is_allowed_chat(state: BotState, chat_id: int) -> bool:
@@ -294,7 +335,7 @@ async def handle_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not _is_admin(state, update.effective_user.id):
         await update.message.reply_text(ADMIN_ONLY_MESSAGE)
         return
-    report = doctor.run_doctor(state.config, state.corpus)
+    report = doctor.run_doctor(state.config, state.corpus, license_status=state.license.status_line())
     await update.message.reply_text(report)
 
 
@@ -739,12 +780,159 @@ async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> No
     doctor.record_last_error(f"Unhandled error: {error}")
 
 
+LICENSE_ALERT_KIND = "license"
+# Commands some handler below answers, so a locked bot replies to them and
+# stays silent on commands meant for other bots.
+KNOWN_COMMANDS = frozenset({"start", "docs", "ask", "doctor", "reset_demo", "remove", "license"})
+
+
+def _command_of(message: Message | None, bot_username: str | None) -> str | None:
+    """The lower-case command a message starts with, or None if it isn't a
+    command for this bot (/cmd@other_bot is someone else's)."""
+    if message is None or not (message.text or "").startswith("/"):
+        return None
+    command, _, target = message.text.split(maxsplit=1)[0][1:].partition("@")
+    if target and target.lower() != (bot_username or "").lower():
+        return None
+    return command.lower()
+
+
+def _locked_reply_wanted(update: Update, state: BotState, bot) -> bool:
+    """Whether the bot would have replied to this message if it weren't
+    locked. A locked bot stays as quiet as an unlocked one: no reply to group
+    chatter, chats outside ALLOWED_CHAT_IDS, or updates with no message."""
+    message = update.message
+    if message is None:
+        return False
+    if message.document is not None:
+        return True
+    command = _command_of(message, bot.username)
+    if command is not None:
+        if command not in KNOWN_COMMANDS:
+            return False
+        return command != "ask" or _is_allowed_chat(state, message.chat.id)
+    if not message.text or not _is_allowed_chat(state, message.chat.id):
+        return False
+    question, _ = classify_message(message, bot.id, bot.username)
+    return question is not None
+
+
+def _license_admin_message(state: BotState) -> str:
+    reason = state.license.lock_reason
+    return LICENSE_LOCKED_ADMIN_MESSAGES.get(reason, LICENSE_LOCKED_ADMIN_BUTTON_MESSAGE)
+
+
+async def license_gate(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs before every real handler. While the license is not active it
+    stops every update, except the admin's /license. It never touches what
+    the bot sends on its own (admin alerts), only updates coming in."""
+    state: BotState = context.bot_data["state"]
+    if state.license.is_active:
+        return
+    if isinstance(update, Update):
+        user = update.effective_user
+        is_admin = user is not None and _is_admin(state, user.id)
+        if is_admin and _command_of(update.message, context.bot.username) == "license":
+            return
+        try:
+            if update.callback_query is not None:
+                # Answer it, or the button keeps spinning.
+                await update.callback_query.answer(
+                    LICENSE_LOCKED_ADMIN_BUTTON_MESSAGE if is_admin else LICENSE_LOCKED_STAFF_MESSAGE,
+                    show_alert=True,
+                )
+            elif _locked_reply_wanted(update, state, context.bot):
+                await update.message.reply_text(
+                    _license_admin_message(state) if is_admin else LICENSE_LOCKED_STAFF_MESSAGE
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not send the locked reply: %s", exc)
+    raise ApplicationHandlerStop
+
+
+async def announce_license_status(bot, state: BotState) -> None:
+    """Tell the admin once when the bot locks, or starts up locked. Nothing
+    is sent while the status stays the same."""
+    if state.license.is_active:
+        state.license_alerted = None
+        return
+    current = (state.license.state.status, state.license.state.reason)
+    if current == state.license_alerted:
+        return
+    state.license_alerted = current
+    # The dedupe above decides; _alert_admin's hourly throttle must not
+    # swallow a new lock that follows an unlock.
+    state.admin_alert_sent_at.pop(LICENSE_ALERT_KIND, None)
+    await _alert_admin(SimpleNamespace(bot=bot), state, LICENSE_ALERT_KIND, _license_admin_message(state))
+
+
+def _format_check_time(value: str | None) -> str:
+    if not value:
+        return "never"
+    try:
+        return datetime.fromisoformat(value).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except ValueError:
+        return value
+
+
+async def handle_license(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/license: check with Gumroad now and report. Admin only; works while
+    the bot is locked."""
+    state: BotState = context.bot_data["state"]
+    if not _is_admin(state, update.effective_user.id):
+        await update.message.reply_text(ADMIN_ONLY_MESSAGE)
+        return
+    summary = await state.license.check()
+    # The admin is reading the result right now; no separate alert needed.
+    state.license_alerted = (
+        None if state.license.is_active else (state.license.state.status, state.license.state.reason)
+    )
+    license_state = state.license.state
+    lines = [
+        f"License: {state.license.status_line()}",
+        f"Key: {licensing.mask_key(state.license.key)}",
+        f"Last confirmed valid: {_format_check_time(license_state.last_ok_at)}",
+        f"Last answer from Gumroad: {_format_check_time(license_state.last_check_at)}",
+        f"Just now: {summary}",
+    ]
+    if not state.license.is_active:
+        lines += ["", _license_admin_message(state)]
+    await update.message.reply_text("\n".join(lines))
+
+
+# The health marker runs first for every update, then the license gate. The
+# gate stops blocked updates with ApplicationHandlerStop, which only skips
+# later groups, so a blocked update is still marked processed and the
+# queue-stall check (and so the exit watchdog) never sees a false stall.
+MARK_PROCESSED_GROUP = -2
+LICENSE_GATE_GROUP = -1
+
+
+def register_handlers(application: Application, polling_health: health.PollingHealth) -> None:
+    async def _mark_update_processed(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        polling_health.record_update_processed()
+
+    application.add_handler(TypeHandler(object, _mark_update_processed), group=MARK_PROCESSED_GROUP)
+    application.add_handler(TypeHandler(object, license_gate), group=LICENSE_GATE_GROUP)
+    application.add_handler(CommandHandler("start", handle_start))
+    application.add_handler(CommandHandler("docs", handle_docs))
+    application.add_handler(CommandHandler("ask", handle_ask))
+    application.add_handler(CommandHandler("doctor", handle_doctor))
+    application.add_handler(CommandHandler("reset_demo", handle_reset_demo))
+    application.add_handler(CommandHandler("remove", handle_remove))
+    application.add_handler(CommandHandler("license", handle_license))
+    application.add_handler(CallbackQueryHandler(handle_remove_button, pattern=rf"^{REMOVE_CALLBACK_PREFIX}:"))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_error_handler(handle_error)
+
+
 def main() -> None:
     config = load_config()
     logging.getLogger().setLevel(config.log_level)
 
     redact_filter = RedactSecretsFilter(
-        [config.telegram_bot_token, config.anthropic_api_key, config.healthcheck_ping_url or ""]
+        [config.telegram_bot_token, config.anthropic_api_key, config.healthcheck_ping_url or "", config.license_key]
     )
     for handler in logging.getLogger().handlers:
         handler.addFilter(redact_filter)
@@ -762,9 +950,10 @@ def main() -> None:
     )
     background_tasks: list[asyncio.Task] = []
     heartbeat_client: httpx.AsyncClient | None = None
+    license_client: httpx.AsyncClient | None = None
 
     async def _start_monitoring(application: Application) -> None:
-        nonlocal heartbeat_client
+        nonlocal heartbeat_client, license_client
         await _register_commands(application, config.admin_user_id)
         background_tasks.append(
             asyncio.create_task(health.queue_monitor_loop(polling_health, application.update_queue))
@@ -778,6 +967,20 @@ def main() -> None:
                 )
             )
 
+        # Its own client: the heartbeat's only exists when HEALTHCHECK_PING_URL is set.
+        license_client = httpx.AsyncClient(timeout=licensing.REQUEST_TIMEOUT_SECONDS)
+        state.license.client = license_client
+        try:
+            await state.license.check()
+            await announce_license_status(application.bot, state)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Startup license check failed: %s: %s", type(exc).__name__, exc)
+        background_tasks.append(
+            asyncio.create_task(
+                licensing.check_loop(state.license, lambda: announce_license_status(application.bot, state))
+            )
+        )
+
     async def _stop_monitoring(application: Application) -> None:
         # Cancel and await inside the running loop, so the heartbeat's httpx
         # client closes here instead of during garbage collection after the
@@ -787,27 +990,13 @@ def main() -> None:
         await asyncio.gather(*background_tasks, return_exceptions=True)
         if heartbeat_client is not None:
             await heartbeat_client.aclose()
+        if license_client is not None:
+            await license_client.aclose()
 
     builder = Application.builder().bot(bot).post_init(_start_monitoring).post_shutdown(_stop_monitoring)
     application = builder.build()
     application.bot_data["state"] = state
-
-    async def _mark_update_processed(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-        polling_health.record_update_processed()
-
-    # Group -1 runs before the real handlers for every update and doesn't
-    # stop them; it only tells the queue-stall check that processing moves.
-    application.add_handler(TypeHandler(object, _mark_update_processed), group=-1)
-    application.add_handler(CommandHandler("start", handle_start))
-    application.add_handler(CommandHandler("docs", handle_docs))
-    application.add_handler(CommandHandler("ask", handle_ask))
-    application.add_handler(CommandHandler("doctor", handle_doctor))
-    application.add_handler(CommandHandler("reset_demo", handle_reset_demo))
-    application.add_handler(CommandHandler("remove", handle_remove))
-    application.add_handler(CallbackQueryHandler(handle_remove_button, pattern=rf"^{REMOVE_CALLBACK_PREFIX}:"))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_error_handler(handle_error)
+    register_handlers(application, polling_health)
 
     logger.info("Deskmate starting for %s (%d documents loaded)", config.company_name, len(corpus))
     health.start_exit_watchdog(polling_health)

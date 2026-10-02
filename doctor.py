@@ -44,7 +44,7 @@ def _data_dir_writable() -> bool:
         return False
 
 
-def run_doctor(config: Config, corpus: Corpus) -> str:
+def run_doctor(config: Config, corpus: Corpus, license_status: str | None = None) -> str:
     lines = ["Deskmate doctor"]
     lines.append(f"Python: {platform.python_version()}")
     lines.append(f"ANTHROPIC_API_KEY: {_mask_secret(config.anthropic_api_key)}")
@@ -55,6 +55,8 @@ def run_doctor(config: Config, corpus: Corpus) -> str:
         lines.append(f"HEALTHCHECK_PING_URL: {_mask_secret(config.healthcheck_ping_url)}")
     else:
         lines.append("HEALTHCHECK_PING_URL: not set (optional)")
+    if license_status is not None:
+        lines.append(f"License: {license_status}")
 
     total_words = corpus.total_word_count()
     lines.append(f"Documents: {len(corpus)} files, {total_words:,} words total")
