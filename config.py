@@ -32,6 +32,9 @@ class Config:
     log_level: str
     healthcheck_ping_url: str | None
     telegram_api_base_url: str = DEFAULT_TELEGRAM_API_BASE_URL
+    # Optional at startup: without it the bot runs but stays locked and tells
+    # the admin on Telegram, instead of exiting. See licensing.py.
+    license_key: str = ""
 
 
 def _fail(message: str) -> None:
@@ -74,4 +77,5 @@ def load_config() -> Config:
         log_level=os.environ.get("LOG_LEVEL", "").strip() or DEFAULT_LOG_LEVEL,
         healthcheck_ping_url=os.environ.get("HEALTHCHECK_PING_URL", "").strip() or None,
         telegram_api_base_url=os.environ.get("TELEGRAM_API_BASE_URL", "").strip() or DEFAULT_TELEGRAM_API_BASE_URL,
+        license_key=os.environ.get("LICENSE_KEY", "").strip(),
     )
