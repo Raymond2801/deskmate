@@ -82,6 +82,9 @@ class LicenseState:
     last_check_at: str | None = None
     last_ok_at: str | None = None
     activation_counted: bool = False
+    # Set when the activation call got a 200 without "uses": the next answer
+    # that has "uses" must still apply MAX_ACTIVATIONS.
+    cap_check_pending: bool = False
 
     @classmethod
     def fresh(cls, key: str) -> "LicenseState":
@@ -101,12 +104,15 @@ def load_state(key: str) -> LicenseState:
             last_check_at=data.get("last_check_at"),
             last_ok_at=data.get("last_ok_at"),
             activation_counted=data["activation_counted"],
+            # Absent in files written before the flag existed.
+            cap_check_pending=data.get("cap_check_pending", False),
         )
         valid = (
             isinstance(state.key_hash, str)
             and state.status in (STATUS_ACTIVE, STATUS_LOCKED)
             and isinstance(state.reason, str)
             and isinstance(state.activation_counted, bool)
+            and isinstance(state.cap_check_pending, bool)
             and all(v is None or isinstance(v, str) for v in (state.last_check_at, state.last_ok_at))
         )
     except FileNotFoundError:
@@ -261,11 +267,17 @@ class LicenseManager:
             # Gumroad counted this activation, whatever happens below.
             state.activation_counted = True
         was_activation_limited = state.status == STATUS_LOCKED and state.reason == REASON_ACTIVATION_LIMIT
-        needs_limit = result.valid_key and not result.revoked and (increment or was_activation_limited)
+        needs_limit = (
+            result.valid_key
+            and not result.revoked
+            and (increment or was_activation_limited or state.cap_check_pending)
+        )
         if needs_limit and result.uses is None:
             # Can't apply the limit without "uses": an unclear answer, so the
-            # status stays as it is. Only the counted activation is saved.
+            # status stays as it is. The counted activation is saved, with a
+            # flag so the limit is still applied once "uses" comes back.
             if increment:
+                state.cap_check_pending = True
                 save_state(state)
             logger.warning(
                 "License check: Gumroad answered without a usable \"uses\"; keeping status %s.", self.status_line()
@@ -280,6 +292,7 @@ class LicenseManager:
             if result.revoked:
                 state.status, state.reason = STATUS_LOCKED, REASON_REVOKED
             elif needs_limit:
+                state.cap_check_pending = False
                 if result.uses <= MAX_ACTIVATIONS:
                     state.status, state.reason = STATUS_ACTIVE, REASON_OK
                 else:

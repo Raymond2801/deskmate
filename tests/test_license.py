@@ -337,6 +337,55 @@ class VolumeTests(TempDataDir):
         self.assertTrue(restarted.is_active)
         self.assertEqual(self.gumroad.increments, ["true", "false", "false"])
 
+    def run_missing_uses_then(self, uses: int) -> licensing.LicenseManager:
+        no_uses = {"success": True, "purchase": purchase()}
+        self.gumroad.queue((200, no_uses), (200, ok_body(uses=uses)))
+        manager = self.manager()
+        self.check(manager)
+        self.assertEqual(manager.lock_reason, licensing.REASON_UNVERIFIED)
+        saved = self.saved()
+        self.assertTrue(saved["activation_counted"])
+        self.assertTrue(saved["cap_check_pending"])
+        self.assertEqual(manager.next_check_delay(), licensing.UNVERIFIED_RETRY_SECONDS)
+        # A restart in between must keep the flag.
+        restarted = self.manager()
+        self.assertTrue(restarted.state.cap_check_pending)
+        self.check(restarted)
+        self.assertEqual(self.gumroad.increments, ["true", "false"])
+        self.assertFalse(self.saved()["cap_check_pending"])
+        return restarted
+
+    def test_missing_uses_then_over_the_limit_locks(self):
+        manager = self.run_missing_uses_then(licensing.MAX_ACTIVATIONS + 1)
+        self.assertEqual(manager.lock_reason, licensing.REASON_ACTIVATION_LIMIT)
+
+    def test_missing_uses_then_within_the_limit_unlocks(self):
+        manager = self.run_missing_uses_then(licensing.MAX_ACTIVATIONS)
+        self.assertTrue(manager.is_active)
+
+    def test_missing_uses_twice_keeps_the_flag_and_counts_once(self):
+        no_uses = {"success": True, "purchase": purchase()}
+        self.gumroad.queue((200, no_uses), (200, no_uses), (200, ok_body(uses=4)))
+        manager = self.manager()
+        self.check(manager)
+        self.check(manager)
+        self.assertEqual(manager.lock_reason, licensing.REASON_UNVERIFIED)
+        self.assertTrue(self.saved()["cap_check_pending"])
+        self.check(manager)
+        self.assertEqual(manager.lock_reason, licensing.REASON_ACTIVATION_LIMIT)
+        self.assertEqual(self.gumroad.increments, ["true", "false", "false"])
+
+    def test_file_without_the_flag_still_loads(self):
+        corpus_module.DATA_DIR.mkdir()
+        licensing.license_file().write_text(json.dumps({
+            "key_hash": licensing.key_hash(KEY), "status": "active", "reason": "ok",
+            "last_check_at": "2026-10-01T00:00:00+00:00", "last_ok_at": "2026-10-01T00:00:00+00:00",
+            "activation_counted": True,
+        }))
+        manager = licensing.LicenseManager(KEY)
+        self.assertTrue(manager.is_active)
+        self.assertFalse(manager.state.cap_check_pending)
+
     def test_invalid_key_unlocks_when_reenabled(self):
         self.gumroad.queue((404, {"success": False}), (200, ok_body(uses=1)))
         manager = self.manager()
