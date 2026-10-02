@@ -664,6 +664,75 @@ class GateTests(TempDataDir):
                 self.assertLessEqual(len(expected), 200)
                 self.assertIsNotNone(self.health.last_update_processed)
 
+    def test_admin_addressing_the_bot_in_a_group_gets_only_the_general_sentence(self):
+        group = {"id": GROUP_ID, "type": "supergroup", "title": "Staff"}
+        mention_text = f"@{BOT_USERNAME} how long is probation?"
+        mention = text_update(mention_text, user_id=ADMIN_ID, chat=group)
+        mention["message"]["entities"] = [{"type": "mention", "offset": 0, "length": len(BOT_USERNAME) + 1}]
+        reply = text_update("and for casuals?", user_id=ADMIN_ID, chat=group)
+        reply["message"]["reply_to_message"] = {
+            "message_id": 9, "date": 0, "chat": group,
+            "from": {"id": BOT_ID, "is_bot": True, "first_name": "Deskmate", "username": BOT_USERNAME},
+            "text": "Answer: 6 months.",
+        }
+        updates = {
+            "mention": mention,
+            "reply": reply,
+            "/ask": text_update("/ask How long is probation?", user_id=ADMIN_ID, chat=group),
+            "/doctor": text_update("/doctor", user_id=ADMIN_ID, chat=group),
+            "/docs@bot": text_update(f"/docs@{BOT_USERNAME}", user_id=ADMIN_ID, chat=group),
+        }
+        for reason in bot.LICENSE_LOCKED_ADMIN_MESSAGES:
+            self.lock(reason)
+            for name, data in updates.items():
+                with self.subTest(reason=reason, update=name):
+                    self.reply_text.reset_mock()
+                    self.deliver(data)
+                    self.assertEqual(self.called(), [])
+                    self.assertEqual(self.replies(), [bot.LICENSE_LOCKED_STAFF_MESSAGE])
+                    sent = " ".join(self.replies())
+                    self.assertNotIn(reason, sent)
+                    self.assertNotIn("license key", sent)
+                    self.assertNotIn("DDDD", sent)
+                    self.assertNotIn(KEY, sent)
+
+    def test_admin_private_chat_still_gets_details(self):
+        self.lock(licensing.REASON_REVOKED)
+        self.deliver(text_update("How long is probation?", user_id=ADMIN_ID))
+        self.assertEqual(self.replies(), [bot.LICENSE_LOCKED_ADMIN_MESSAGES[licensing.REASON_REVOKED]])
+
+    def test_admin_license_in_a_group_reaches_the_handler(self):
+        # The handler then answers with the private-chat pointer
+        # (LicenseCommandTests); the gate itself sends nothing.
+        self.lock()
+        group = {"id": GROUP_ID, "type": "supergroup", "title": "Staff"}
+        self.deliver(text_update("/license", user_id=ADMIN_ID, chat=group))
+        self.assertEqual(self.called(), ["handle_license"])
+        self.assertEqual(self.replies(), [])
+
+    def test_staff_license_in_a_group_gets_the_general_sentence(self):
+        self.lock()
+        group = {"id": GROUP_ID, "type": "supergroup", "title": "Staff"}
+        self.deliver(text_update("/license", user_id=STAFF_ID, chat=group))
+        self.assertEqual(self.called(), [])
+        self.assertEqual(self.replies(), [bot.LICENSE_LOCKED_STAFF_MESSAGE])
+
+    def test_admin_button_in_a_group_gets_the_general_sentence(self):
+        self.lock()
+        group = {"id": GROUP_ID, "type": "supergroup", "title": "Staff"}
+        self.deliver({
+            "update_id": 4,
+            "callback_query": {
+                "id": "cb2",
+                "from": user(ADMIN_ID),
+                "chat_instance": "ci",
+                "data": "rm:abcd1234:yes",
+                "message": {"message_id": 12, "date": 0, "chat": group, "text": "Remove?"},
+            },
+        })
+        self.assertEqual(self.called(), [])
+        self.answer.assert_awaited_once_with(bot.LICENSE_LOCKED_STAFF_MESSAGE, show_alert=True)
+
     def test_group_chatter_is_blocked_silently(self):
         self.lock()
         group = {"id": GROUP_ID, "type": "supergroup", "title": "Staff"}
@@ -790,9 +859,10 @@ class LicenseCommandTests(TempDataDir):
         self.context = mock.Mock()
         self.context.bot_data = {"state": self.state}
 
-    def run_command(self, user_id: int) -> str:
+    def run_command(self, user_id: int, chat_type: str = "private") -> str:
         update = mock.Mock()
         update.effective_user.id = user_id
+        update.effective_chat.type = chat_type
         update.message.reply_text = mock.AsyncMock()
         asyncio.run(bot.handle_license(update, self.context))
         return update.message.reply_text.await_args.args[0]
@@ -819,6 +889,36 @@ class LicenseCommandTests(TempDataDir):
         bot_mock.send_message = mock.AsyncMock()
         asyncio.run(bot.announce_license_status(bot_mock, self.state))
         bot_mock.send_message.assert_not_awaited()
+
+    def test_admin_license_in_a_group_points_to_a_private_chat(self):
+        for locked in (False, True):
+            with self.subTest(locked=locked):
+                self.state.license.state.status = licensing.STATUS_LOCKED if locked else licensing.STATUS_ACTIVE
+                self.state.license.state.reason = licensing.REASON_REVOKED if locked else licensing.REASON_OK
+                for chat_type in ("group", "supergroup"):
+                    reply = self.run_command(ADMIN_ID, chat_type=chat_type)
+                    self.assertEqual(reply, "Please send /license to me in a private chat.")
+                self.assertEqual(self.gumroad.requests, [])
+
+    def test_staff_license_in_a_group_keeps_the_existing_reply(self):
+        self.assertEqual(self.run_command(STAFF_ID, chat_type="supergroup"), bot.ADMIN_ONLY_MESSAGE)
+        self.assertEqual(self.gumroad.requests, [])
+
+    def test_doctor_in_a_group_hides_the_lock_reason(self):
+        self.state.license.state.status = licensing.STATUS_LOCKED
+        self.state.license.state.reason = licensing.REASON_REVOKED
+        reports = {}
+        for chat_type in ("private", "supergroup"):
+            update = mock.Mock()
+            update.effective_user.id = ADMIN_ID
+            update.effective_chat.type = chat_type
+            update.message.reply_text = mock.AsyncMock()
+            asyncio.run(bot.handle_doctor(update, self.context))
+            reports[chat_type] = update.message.reply_text.await_args.args[0]
+        self.assertIn("License: locked (revoked)", reports["private"])
+        self.assertIn("License: locked\n", reports["supergroup"])
+        self.assertNotIn("revoked", reports["supergroup"])
+        self.assertNotIn("DDDD", reports["supergroup"])
 
     def test_gumroad_down_is_reported_not_fatal(self):
         self.gumroad.queue(httpx.ConnectError("refused"))

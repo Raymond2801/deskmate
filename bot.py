@@ -192,6 +192,8 @@ LICENSE_LOCKED_ADMIN_MESSAGES = {
 }
 # A button's popup is capped at 200 characters, so the admin gets a pointer.
 LICENSE_LOCKED_ADMIN_BUTTON_MESSAGE = "Deskmate is locked. Send /license for details."
+# License details (reason, masked key) only ever go to a private chat.
+LICENSE_PRIVATE_ONLY_MESSAGE = "Please send /license to me in a private chat."
 
 UNSUPPORTED_FILE_MESSAGE = (
     "I can only read .md, .txt, .docx, and .pdf files. Please convert this "
@@ -304,6 +306,11 @@ def _is_admin(state: BotState, user_id: int) -> bool:
     return user_id == state.config.admin_user_id
 
 
+def _is_private_chat(update: Update) -> bool:
+    chat = update.effective_chat
+    return chat is not None and chat.type == ChatType.PRIVATE
+
+
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state: BotState = context.bot_data["state"]
     await update.message.reply_text(
@@ -335,7 +342,13 @@ async def handle_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not _is_admin(state, update.effective_user.id):
         await update.message.reply_text(ADMIN_ONLY_MESSAGE)
         return
-    report = doctor.run_doctor(state.config, state.corpus, license_status=state.license.status_line())
+    # The lock reason is for the admin's private chat only. (While locked the
+    # gate stops /doctor anyway; this keeps a group report free of it.)
+    if _is_private_chat(update):
+        license_status = state.license.status_line()
+    else:
+        license_status = "active" if state.license.is_active else "locked"
+    report = doctor.run_doctor(state.config, state.corpus, license_status=license_status)
     await update.message.reply_text(report)
 
 
@@ -834,6 +847,9 @@ async def license_gate(update: object, context: ContextTypes.DEFAULT_TYPE) -> No
         is_admin = user is not None and _is_admin(state, user.id)
         if is_admin and _command_of(update.message, context.bot.username) == "license":
             return
+        # Outside the admin's private chat everyone, the admin included, gets
+        # the general sentence: a group never sees why the bot is locked.
+        is_admin = is_admin and _is_private_chat(update)
         try:
             if update.callback_query is not None:
                 # Answer it, or the button keeps spinning.
@@ -881,6 +897,9 @@ async def handle_license(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     state: BotState = context.bot_data["state"]
     if not _is_admin(state, update.effective_user.id):
         await update.message.reply_text(ADMIN_ONLY_MESSAGE)
+        return
+    if not _is_private_chat(update):
+        await update.message.reply_text(LICENSE_PRIVATE_ONLY_MESSAGE)
         return
     summary = await state.license.check()
     # The admin is reading the result right now; no separate alert needed.
