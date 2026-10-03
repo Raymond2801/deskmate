@@ -37,6 +37,8 @@ logger = logging.getLogger("deskmate.license")
 GUMROAD_PRODUCT_ID = "fLgKYwn4yDwzHG1bt-b99g=="
 GUMROAD_VERIFY_URL = "https://api.gumroad.com/v2/licenses/verify"
 MAX_ACTIVATIONS = 3
+# Who a locked admin is told to contact. Used in the admin's lock messages.
+SUPPORT_CONTACT = "the seller (reply to your Gumroad receipt email)"
 CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 # Until Gumroad has answered once for this key, retry sooner.
 UNVERIFIED_RETRY_SECONDS = 15 * 60

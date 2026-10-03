@@ -661,6 +661,33 @@ class GateTests(TempDataDir):
                 self.assertEqual(self.called(), [])
                 self.assertEqual(self.replies(), [text])
 
+    def test_admin_private_message_names_the_contact_for_three_reasons(self):
+        for reason in (licensing.REASON_INVALID, licensing.REASON_REVOKED, licensing.REASON_ACTIVATION_LIMIT):
+            with self.subTest(reason):
+                self.reply_text.reset_mock()
+                self.lock(reason)
+                self.deliver(text_update("How long is probation?", user_id=ADMIN_ID))
+                self.assertEqual(self.called(), [])
+                self.assertEqual(self.replies(), [bot.LICENSE_LOCKED_ADMIN_MESSAGES[reason]])
+                self.assertIn(licensing.SUPPORT_CONTACT, self.replies()[0])
+
+    def test_staff_and_group_messages_are_unchanged_and_omit_the_contact(self):
+        group = {"id": GROUP_ID, "type": "supergroup", "title": "Staff"}
+        general = "Deskmate is not available right now. Please contact your administrator."
+        updates = {
+            "staff in private": text_update("How long is probation?"),
+            "staff in group": text_update("/ask How long is probation?", chat=group),
+            "admin in group": text_update("/ask How long is probation?", user_id=ADMIN_ID, chat=group),
+        }
+        for reason in bot.LICENSE_LOCKED_ADMIN_MESSAGES:
+            self.lock(reason)
+            for name, data in updates.items():
+                with self.subTest(reason=reason, update=name):
+                    self.reply_text.reset_mock()
+                    self.deliver(data)
+                    self.assertEqual(self.replies(), [general])
+                    self.assertNotIn(licensing.SUPPORT_CONTACT, self.replies()[0])
+
     def test_every_admin_command_is_blocked_except_license(self):
         self.lock()
         for command in ("/start", "/docs", "/ask hi", "/doctor", "/reset_demo", "/remove Handbook.md"):
@@ -742,6 +769,7 @@ class GateTests(TempDataDir):
                     sent = " ".join(self.replies())
                     self.assertNotIn(reason, sent)
                     self.assertNotIn("license key", sent)
+                    self.assertNotIn(licensing.SUPPORT_CONTACT, sent)
                     self.assertNotIn("DDDD", sent)
                     self.assertNotIn(KEY, sent)
 
@@ -976,10 +1004,51 @@ class LicenseCommandTests(TempDataDir):
         self.assertIn("License: locked (unverified)", reply)
 
 
+class LockedAdminWordingTests(unittest.TestCase):
+    def test_admin_messages_use_the_agreed_wording(self):
+        contact = licensing.SUPPORT_CONTACT
+        limit = licensing.MAX_ACTIVATIONS
+        self.assertEqual(bot.LICENSE_LOCKED_ADMIN_MESSAGES, {
+            licensing.REASON_MISSING: (
+                "Deskmate is locked because no license key is set, so it is not answering anyone. "
+                "Add your Gumroad license key as the LICENSE_KEY variable in Railway, then redeploy. "
+                "You can find the key in your Gumroad receipt email or on the product's content page."
+            ),
+            licensing.REASON_INVALID: (
+                "Deskmate is locked because Gumroad does not accept the license key in LICENSE_KEY, "
+                "so it is not answering anyone. The key may be mistyped or switched off. Check it against "
+                "your Gumroad receipt and fix LICENSE_KEY in Railway, then redeploy. "
+                f"If the key is right, contact {contact}. Send /license to check again."
+            ),
+            licensing.REASON_REVOKED: (
+                "Deskmate is locked because the purchase for this license key was refunded or disputed, "
+                "so it is not answering anyone. If you think this is a mistake, contact "
+                f"{contact}, then send /license to check again."
+            ),
+            licensing.REASON_ACTIVATION_LIMIT: (
+                f"Deskmate is locked because this license key has been activated more than {limit} times, "
+                f"so it is not answering anyone. Each purchase covers up to {limit} activations. "
+                f"To reset the count, contact {contact}, then send /license to check again."
+            ),
+            licensing.REASON_UNVERIFIED: (
+                "Deskmate could not reach Gumroad to check its license yet, so it is not answering anyone. "
+                "It tries again every 15 minutes. Send /license to try now."
+            ),
+        })
+
+    def test_general_sentence_is_unchanged(self):
+        self.assertEqual(
+            bot.LICENSE_LOCKED_STAFF_MESSAGE,
+            "Deskmate is not available right now. Please contact your administrator.",
+        )
+        self.assertNotIn(licensing.SUPPORT_CONTACT, bot.LICENSE_LOCKED_STAFF_MESSAGE)
+        self.assertNotIn(licensing.SUPPORT_CONTACT, bot.LICENSE_LOCKED_ADMIN_BUTTON_MESSAGE)
+
+
 class CustomerTextTests(unittest.TestCase):
     def test_no_em_dashes_in_license_messages(self):
         texts = [bot.LICENSE_LOCKED_STAFF_MESSAGE, bot.LICENSE_LOCKED_ADMIN_BUTTON_MESSAGE,
-                 *bot.LICENSE_LOCKED_ADMIN_MESSAGES.values()]
+                 licensing.SUPPORT_CONTACT, *bot.LICENSE_LOCKED_ADMIN_MESSAGES.values()]
         for text in texts:
             self.assertNotIn("—", text)
             self.assertNotIn("–", text)

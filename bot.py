@@ -167,23 +167,25 @@ LICENSE_LOCKED_STAFF_MESSAGE = "Deskmate is not available right now. Please cont
 LICENSE_LOCKED_ADMIN_MESSAGES = {
     licensing.REASON_MISSING: (
         "Deskmate is locked because no license key is set, so it is not answering anyone. "
-        "Add your Gumroad license key as the LICENSE_KEY variable in Railway, then redeploy."
+        "Add your Gumroad license key as the LICENSE_KEY variable in Railway, then redeploy. "
+        "You can find the key in your Gumroad receipt email or on the product's content page."
     ),
     licensing.REASON_INVALID: (
-        "Deskmate is locked because Gumroad does not recognise the license key in LICENSE_KEY, "
-        "so it is not answering anyone. Check the key against your Gumroad receipt, fix LICENSE_KEY "
-        "in Railway and redeploy. Send /license to check again."
+        "Deskmate is locked because Gumroad does not accept the license key in LICENSE_KEY, "
+        "so it is not answering anyone. The key may be mistyped or switched off. Check it against "
+        "your Gumroad receipt and fix LICENSE_KEY in Railway, then redeploy. "
+        f"If the key is right, contact {licensing.SUPPORT_CONTACT}. Send /license to check again."
     ),
     licensing.REASON_REVOKED: (
         "Deskmate is locked because the purchase for this license key was refunded or disputed, "
-        "so it is not answering anyone. If you think this is a mistake, contact the seller, then "
-        "send /license to check again."
+        "so it is not answering anyone. If you think this is a mistake, contact "
+        f"{licensing.SUPPORT_CONTACT}, then send /license to check again."
     ),
     licensing.REASON_ACTIVATION_LIMIT: (
         f"Deskmate is locked because this license key has been activated more than "
         f"{licensing.MAX_ACTIVATIONS} times, so it is not answering anyone. Each purchase covers up "
-        f"to {licensing.MAX_ACTIVATIONS} activations. Ask the seller to reset the count, then send "
-        "/license to check again."
+        f"to {licensing.MAX_ACTIVATIONS} activations. To reset the count, contact "
+        f"{licensing.SUPPORT_CONTACT}, then send /license to check again."
     ),
     licensing.REASON_UNVERIFIED: (
         "Deskmate could not reach Gumroad to check its license yet, so it is not answering anyone. "
