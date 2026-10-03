@@ -1036,6 +1036,11 @@ class LockedAdminWordingTests(unittest.TestCase):
             ),
         })
 
+    def test_support_contact_wording(self):
+        # The test above builds its expectation from this constant, so it
+        # alone would not notice the contact text changing.
+        self.assertEqual(licensing.SUPPORT_CONTACT, "the seller (reply to your Gumroad receipt email)")
+
     def test_general_sentence_is_unchanged(self):
         self.assertEqual(
             bot.LICENSE_LOCKED_STAFF_MESSAGE,
